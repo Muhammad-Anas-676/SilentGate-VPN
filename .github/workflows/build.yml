@@ -91,8 +91,31 @@ jobs:
         with:
           gradle-version: 8.10.2
 
-      - name: Build release APK
-        run: gradle :app:assembleRelease --no-daemon --stacktrace
+      - name: Check repository access (diagnostics)
+        run: |
+          for u in \
+            https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/1.9.24/kotlin-stdlib-1.9.24.pom \
+            https://dl.google.com/dl/android/maven2/androidx/core/core-ktx/1.15.0/core-ktx-1.15.0.pom \
+            https://plugins.gradle.org/m2/org/jetbrains/kotlin/kotlin-gradle-plugin/2.0.21/kotlin-gradle-plugin-2.0.21.pom ; do
+            echo "== $u"
+            curl -sS -o /dev/null -w "HTTP %{http_code}, %{size_download} bytes\n" -L "$u" || echo "curl failed"
+          done
+
+      - name: Build release APK (with retries)
+        env:
+          GRADLE_OPTS: -Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::Attempt $attempt"
+            if gradle :app:assembleRelease --no-daemon --stacktrace --refresh-dependencies; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "Build failed, retrying in 30s..."
+            sleep 30
+          done
+          exit 1
 
       - uses: actions/upload-artifact@v4
         with:
