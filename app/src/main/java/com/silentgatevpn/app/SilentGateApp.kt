@@ -2,7 +2,15 @@ package com.silentgatevpn.app
 
 import android.app.Application
 import android.os.Build
+import android.content.Context
+import android.telephony.TelephonyManager
+import com.silentgatevpn.app.vpn.Net
+import com.silentgatevpn.app.vpn.NodePool
 import com.silentgatevpn.app.vpn.ProfileStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import com.silentgatevpn.app.vpn.SettingsStore
 import com.silentgatevpn.app.vpn.VpnState
 import io.nekohasekai.libbox.Libbox
@@ -14,6 +22,19 @@ class SilentGateApp : Application() {
         super.onCreate()
         SettingsStore.init(this)
         ProfileStore.init(this)
+        NodePool.init(File(filesDir, "pool").apply { mkdirs() })
+        // Last-resort home country if the live check fails: the SIM / network country, then Pakistan.
+        runCatching {
+            val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            val cc = tm.networkCountryIso.ifEmpty { tm.simCountryIso }
+            if (cc.length == 2) Net.defaultHomeCc = cc.uppercase()
+        }
+        // Keep the node list fresh in the background (not on the main thread).
+        if (SettingsStore.value.consented && SettingsStore.value.communityNodes) {
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                if (NodePool.isStale()) runCatching { NodePool.refresh() }
+            }
+        }
         runCatching {
             val work = File(filesDir, "work").apply { mkdirs() }
             val opts = SetupOptions()

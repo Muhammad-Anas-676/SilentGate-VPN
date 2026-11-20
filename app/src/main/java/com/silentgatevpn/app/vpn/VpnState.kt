@@ -14,12 +14,20 @@ data class ExitInfo(
     val warpOn: Boolean?,
     val colo: String,
     val pingMs: Long,
-    val restricted: Boolean
+    val restricted: Boolean,
+    val geoLocal: Boolean = false,
+    val ipChanged: Boolean = true
 )
+
+/** What the shield may honestly claim. */
+enum class Protection { NONE, FULL, GEO_LOCAL, DPI_ONLY }
 
 object VpnState {
     val status = MutableStateFlow(Status.DISCONNECTED)
     val layer = MutableStateFlow<ConfigBuilder.Layer?>(null)
+    val protection = MutableStateFlow(Protection.NONE)
+    val node = MutableStateFlow("")
+    val nodeCc = MutableStateFlow("")
     val message = MutableStateFlow("")
     val exit = MutableStateFlow<ExitInfo?>(null)
     val rxSpeed = MutableStateFlow(0L)
@@ -29,6 +37,7 @@ object VpnState {
     val alwaysOn = MutableStateFlow(false)
     val lockdown = MutableStateFlow(false)
     val log = MutableStateFlow<List<String>>(emptyList())
+    val lastFailure = MutableStateFlow<List<String>>(emptyList())
 
     fun log(line: String) {
         log.value = (log.value + line).takeLast(80)
@@ -37,6 +46,9 @@ object VpnState {
     fun resetSession() {
         rxSpeed.value = 0; txSpeed.value = 0; sessionRx.value = 0; sessionTx.value = 0
         exit.value = null
+        protection.value = Protection.NONE
+        node.value = ""
+        nodeCc.value = ""
     }
 }
 

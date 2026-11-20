@@ -1,7 +1,9 @@
 package com.silentgatevpn.app.ui
 
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -62,5 +64,14 @@ private val SgTypography = Typography(
 
 @Composable
 fun SilentGateTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = AmoledScheme, typography = SgTypography, content = content)
+    MaterialTheme(colorScheme = AmoledScheme, typography = SgTypography) {
+        // Surface supplies LocalContentColor (onBackground). Without it, any Text outside a Scaffold
+        // falls back to black and becomes invisible on the black background.
+        Surface(
+            modifier = androidx.compose.ui.Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background,
+            contentColor = MaterialTheme.colorScheme.onBackground,
+            content = content
+        )
+    }
 }

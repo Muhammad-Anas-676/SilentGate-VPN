@@ -10,11 +10,15 @@ import org.json.JSONObject
 import java.util.UUID
 
 enum class ConnectMode(val label: String, val hint: String) {
-    AUTO("Auto", "WARP, then Stealth, then Light"),
-    WARP("WARP", "Obfuscated Cloudflare WARP only"),
-    STEALTH("Stealth", "VLESS over WebSocket + TLS"),
-    LIGHT("Light", "TLS fragmentation + encrypted DNS")
+    AUTO("Smart Auto", "Your own server, then community nodes in safe countries, then WARP. It never falls back to an unmasked connection."),
+    NODES("Nodes", "Community nodes only, with automatic failover and safe exit countries."),
+    WARP("WARP", "Obfuscated Cloudflare WARP only. Websites may see an exit near your own country."),
+    WARP_NODE("WARP + Node", "WARP chained through a node, so the exit follows the node instead of your ISP's country (experimental)."),
+    MY_SERVER("My server", "Your own VLESS / Trojan / Hysteria2 / WireGuard profile from the Profiles tab."),
+    DPI_ONLY("DPI only", "Unblocks filtered sites with TLS fragmentation. It does NOT hide your IP address or country.")
 }
+
+enum class QuicMode(val label: String) { AUTO("Smart"), BLOCK("Block QUIC"), ALLOW("Allow QUIC") }
 
 enum class WarpTunnel(val label: String, val core: String) {
     AUTO("Auto", "auto"),
@@ -23,16 +27,17 @@ enum class WarpTunnel(val label: String, val core: String) {
     MASQUE("MASQUE", "masque")
 }
 
-enum class DnsProvider(val label: String, val server: String, val sni: String?) {
-    CLOUDFLARE("Cloudflare 1.1.1.1", "1.1.1.1", null),
-    QUAD9("Quad9 unfiltered", "9.9.9.10", "dns10.quad9.net"),
-    ADGUARD("AdGuard unfiltered", "94.140.14.140", "unfiltered.adguard-dns.com")
+enum class DnsProvider(val label: String, val server: String, val sni: String?, val keywords: List<String>) {
+    CLOUDFLARE("Cloudflare 1.1.1.1", "1.1.1.1", null, listOf("cloudflare")),
+    QUAD9("Quad9 unfiltered", "9.9.9.10", "dns10.quad9.net", listOf("quad9", "pch", "woodynet")),
+    ADGUARD("AdGuard unfiltered", "94.140.14.140", "unfiltered.adguard-dns.com", listOf("adguard")),
+    GOOGLE("Google 8.8.8.8", "8.8.8.8", "dns.google", listOf("google"))
 }
 
 enum class SplitMode(val label: String) { OFF("Off"), EXCLUDE("Bypass selected"), ONLY("Only selected") }
 enum class Ipv6Mode(val label: String) { BLOCK("Block (safest)"), TUNNEL("Tunnel") }
 
-const val CONSENT_VERSION = 1
+const val CONSENT_VERSION = 2
 
 data class AppSettings(
     val consentVersion: Int = 0,
@@ -50,7 +55,14 @@ data class AppSettings(
     val splitMode: SplitMode = SplitMode.OFF,
     val splitPackages: Set<String> = emptySet(),
     val activeProfileId: String? = null,
-    val mtu: Int = 1400
+    /** 0 = automatic (per protocol and per carrier path). */
+    val mtuOverride: Int = 0,
+    val communityNodes: Boolean = true,
+    /** "AUTO" or an ISO country code chosen in the location picker. */
+    val preferredCountry: String = "AUTO",
+    val avoidRestricted: Boolean = true,
+    val allowHomeExit: Boolean = false,
+    val quic: QuicMode = QuicMode.AUTO
 ) {
     val consented: Boolean get() = consentVersion >= CONSENT_VERSION
 
@@ -70,7 +82,12 @@ data class AppSettings(
         put("splitMode", splitMode.name)
         put("splitPackages", JSONArray(splitPackages.toList()))
         put("activeProfileId", activeProfileId ?: JSONObject.NULL)
-        put("mtu", mtu)
+        put("mtuOverride", mtuOverride)
+        put("communityNodes", communityNodes)
+        put("preferredCountry", preferredCountry)
+        put("avoidRestricted", avoidRestricted)
+        put("allowHomeExit", allowHomeExit)
+        put("quic", quic.name)
     }
 
     companion object {
@@ -84,7 +101,7 @@ data class AppSettings(
             return AppSettings(
                 consentVersion = o.optInt("consentVersion", 0),
                 consentTime = o.optLong("consentTime", 0L),
-                mode = o.enumOr("mode", d.mode),
+                mode = o.enumOr("mode", d.mode),   // an old "LIGHT" value falls back to Smart Auto
                 warpTunnel = o.enumOr("warpTunnel", d.warpTunnel),
                 noise = o.optBoolean("noise", d.noise),
                 scanner = o.optBoolean("scanner", d.scanner),
@@ -97,7 +114,12 @@ data class AppSettings(
                 splitMode = o.enumOr("splitMode", d.splitMode),
                 splitPackages = pkgs,
                 activeProfileId = if (o.isNull("activeProfileId")) null else o.optString("activeProfileId"),
-                mtu = o.optInt("mtu", d.mtu)
+                mtuOverride = o.optInt("mtuOverride", d.mtuOverride),
+                communityNodes = o.optBoolean("communityNodes", d.communityNodes),
+                preferredCountry = o.optString("preferredCountry", d.preferredCountry).ifEmpty { "AUTO" },
+                avoidRestricted = o.optBoolean("avoidRestricted", d.avoidRestricted),
+                allowHomeExit = o.optBoolean("allowHomeExit", d.allowHomeExit),
+                quic = o.enumOr("quic", d.quic)
             )
         }
     }
@@ -122,9 +144,10 @@ object SettingsStore {
     }
 }
 
-/** A user supplied Stealth profile: a vless:// link or a raw sing-box outbound/endpoint JSON object. */
+/** A user supplied profile: any share link (vless/trojan/hysteria2/tuic/ss/wg ...) or a raw sing-box outbound/endpoint JSON. */
 data class Profile(val id: String, val name: String, val kind: String, val data: String) {
-    val subtitle: String get() = if (kind == "vless") "VLESS link" else "Custom JSON"
+    val subtitle: String
+        get() = runCatching { ProxyParser.parseAny(data).subtitle }.getOrDefault(if (kind == "json") "Custom JSON" else "Share link")
 }
 
 object ProfileStore {
@@ -156,19 +179,12 @@ object ProfileStore {
     fun import(text: String): String? {
         val t = text.trim()
         if (t.isEmpty()) return "Nothing to import"
-        val profile: Profile = when {
-            t.startsWith("vless://", ignoreCase = true) -> {
-                val parsed = runCatching { VlessLink.parse(t) }.getOrElse { return "Invalid VLESS link: ${it.message}" }
-                Profile(UUID.randomUUID().toString(), parsed.name, "vless", t)
-            }
-            t.startsWith("{") -> {
-                val o = runCatching { JSONObject(t) }.getOrElse { return "Invalid JSON: ${it.message}" }
-                val type = o.optString("type")
-                if (type.isEmpty()) return "JSON needs a \"type\" field (vless, wireguard, awg ...)"
-                Profile(UUID.randomUUID().toString(), o.optString("tag").ifEmpty { "Custom $type" }, "json", t)
-            }
-            else -> return "Paste a vless:// link or a sing-box outbound/endpoint JSON object"
+        if (t.startsWith("http://", true) || t.startsWith("https://", true)) {
+            return "That is a subscription URL. Use \"Add subscription\" in the Community nodes section."
         }
+        val parsed = runCatching { ProxyParser.parseAny(t) }.getOrElse { return "Invalid profile: ${it.message}" }
+        val kind = if (t.startsWith("{")) "json" else "link"
+        val profile = Profile(UUID.randomUUID().toString(), parsed.name, kind, t)
         _flow.value = _flow.value + profile
         save()
         if (SettingsStore.value.activeProfileId == null) SettingsStore.update { it.copy(activeProfileId = profile.id) }

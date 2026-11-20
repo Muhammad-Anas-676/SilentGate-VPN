@@ -24,6 +24,7 @@ import com.silentgatevpn.app.legal.LegalDoc
 import com.silentgatevpn.app.legal.LegalDocs
 import com.silentgatevpn.app.vpn.DnsProvider
 import com.silentgatevpn.app.vpn.Ipv6Mode
+import com.silentgatevpn.app.vpn.QuicMode
 import com.silentgatevpn.app.vpn.SettingsStore
 import com.silentgatevpn.app.vpn.WarpTunnel
 
@@ -58,14 +59,34 @@ fun SettingsScreen(onOpenDoc: (LegalDoc) -> Unit) {
             ToggleRow("Search for noise preset", "If handshakes fail, tries several junk-packet presets and remembers the one that works.", s.searchNoise) { v -> SettingsStore.update { it.copy(searchNoise = v) } }
         }
 
-        SectionTitle("Light layer (TLS fragmentation)")
+        SectionTitle("Safe exit")
         SgCardBox {
-            Text("Splits the TLS hello into small pieces to defeat SNI-only filters. Does not hide your IP from the destination.",
+            ToggleRow("Avoid age-verification regions", "Skips exits in countries and US states that force age checks (UK, France, Germany, Texas and others).", s.avoidRestricted) { v -> SettingsStore.update { it.copy(avoidRestricted = v) } }
+            ToggleRow("Allow exit in my own country", "Off by default: an exit in your home country defeats the point of a VPN for local-content and geo flags.", s.allowHomeExit) { v -> SettingsStore.update { it.copy(allowHomeExit = v) } }
+        }
+
+        SectionTitle("Media and QUIC")
+        SgCardBox {
+            Text("Smart blocks HTTP/3 (UDP 443) only when the chosen node cannot carry UDP natively, so browsers fall back to TCP and thumbnails load instead of hanging.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 10.dp))
+            ChoiceChips(QuicMode.entries, s.quic, { it.label }) { m -> SettingsStore.update { it.copy(quic = m) } }
+            Spacer(Modifier.height(12.dp))
+            Text("Tunnel MTU", style = MaterialTheme.typography.titleMedium)
+            Text("Auto picks 1280 for WARP/WireGuard, about 1350 for QUIC protocols and up to 1450 for TCP protocols, and lowers it to fit your carrier.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp, bottom = 10.dp))
+            ChoiceChips(listOf(0, 1280, 1400, 1500), s.mtuOverride, { if (it == 0) "Auto" else it.toString() }) { m -> SettingsStore.update { it.copy(mtuOverride = m) } }
+        }
+
+        SectionTitle("DPI Bypass Only (no IP change)")
+        SgCardBox {
+            Text("Used by the DPI-only mode and, optionally, on TLS nodes. Splits the TLS hello into small pieces to defeat SNI-only filters. It never hides your IP by itself.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(bottom = 10.dp))
             ChoiceChips(presets, currentPreset, { it.label }) { p -> SettingsStore.update { it.copy(fragSize = p.size, fragSleep = p.sleep) } }
             Spacer(Modifier.height(8.dp))
-            ToggleRow("Fragment Stealth profiles", "Also fragment the TLS hello of your VLESS profile.", s.fragmentStealth) { v -> SettingsStore.update { it.copy(fragmentStealth = v) } }
+            ToggleRow("Fragment node and profile TLS", "Also fragment the TLS hello of TLS-based nodes and your own profiles.", s.fragmentStealth) { v -> SettingsStore.update { it.copy(fragmentStealth = v) } }
         }
 
         SectionTitle("DNS")
@@ -82,6 +103,16 @@ fun SettingsScreen(onOpenDoc: (LegalDoc) -> Unit) {
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(bottom = 10.dp))
             ChoiceChips(Ipv6Mode.entries, s.ipv6, { it.label }) { m -> SettingsStore.update { it.copy(ipv6 = m) } }
+        }
+
+        SectionTitle("Battery (Infinix and other budget phones)")
+        SgCardBox {
+            Text("Infinix, Tecno and Itel battery managers kill background VPNs. Set SilentGate to Unrestricted / No restrictions, and allow Auto-start in the phone manager.",
+                style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = {
+                ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }) { Text("Open battery optimization") }
         }
 
         SectionTitle("Kill switch")
@@ -101,7 +132,7 @@ fun SettingsScreen(onOpenDoc: (LegalDoc) -> Unit) {
 
         SectionTitle("About")
         SgCardBox {
-            InfoLine("Version", "1.0.0")
+            InfoLine("Version", com.silentgatevpn.app.BuildConfig.VERSION_NAME)
             InfoLine("Package", "com.silentgatevpn.app")
             InfoLine("Core", "Hiddify sing-box (libbox)")
             InfoLine("Licence", "GPL-3.0, source public")

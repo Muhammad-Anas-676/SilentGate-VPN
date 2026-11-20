@@ -5,72 +5,112 @@ import org.json.JSONObject
 
 object ConfigBuilder {
 
-    enum class Layer(val title: String, val timeoutMs: Long) {
-        WARP("Obfuscated WARP", 45_000),
-        STEALTH("Stealth VLESS", 25_000),
-        LIGHT("TLS Fragment + DoH", 15_000)
+    /** [masksIp] decides whether the app may ever show "Protected" for this layer. */
+    enum class Layer(val title: String, val timeoutMs: Long, val masksIp: Boolean) {
+        NODE("Smart Node", 7_000, true),
+        MY_SERVER("My server", 15_000, true),
+        WARP("Obfuscated WARP", 30_000, true),
+        WARP_NODE("WARP via Node", 25_000, true),
+        DPI_ONLY("DPI Bypass Only (No IP Change)", 10_000, false)
     }
+
+    /** Per-connection inputs computed by the service before each attempt. */
+    class Ctx(
+        val bootstrap: List<DnsProvider>,
+        val underlyingMtu: Int,
+        val serverIp: String? = null
+    )
 
     private val ENDPOINT_TYPES = setOf("wireguard", "awg", "warp")
 
     private fun obj(vararg p: Pair<String, Any?>) = JSONObject().apply { p.forEach { (k, v) -> put(k, v) } }
     private fun arr(vararg v: Any) = JSONArray().apply { v.forEach { put(it) } }
 
-    private fun fragmentJson(s: AppSettings) = obj(
-        "enabled" to true, "size" to s.fragSize, "sleep" to s.fragSleep
-    )
+    private fun fragmentJson(s: AppSettings) = obj("enabled" to true, "size" to s.fragSize, "sleep" to s.fragSleep)
 
-    fun build(layer: Layer, s: AppSettings, profile: Profile?): String {
+    /** How many progressively simpler configs exist for a layer (used when the core rejects an option). */
+    fun variants(layer: Layer): Int = when (layer) {
+        Layer.WARP, Layer.WARP_NODE -> 3
+        Layer.NODE, Layer.MY_SERVER, Layer.DPI_ONLY -> 2
+    }
+
+    /** True when UDP/443 (QUIC / HTTP3) should be rejected so browsers fall back to TCP, which carries thumbnails reliably. */
+    fun blockQuic(s: AppSettings, layer: Layer, proxy: ParsedProxy?): Boolean = when (s.quic) {
+        QuicMode.BLOCK -> true
+        QuicMode.ALLOW -> false
+        QuicMode.AUTO -> when (layer) {
+            Layer.DPI_ONLY -> true                          // QUIC would bypass the fragmented TLS path entirely
+            Layer.WARP -> false
+            else -> proxy != null && !proxy.udpNative       // UDP inside a TCP-based proxy makes QUIC stall
+        }
+    }
+
+    fun tunMtu(s: AppSettings, layer: Layer, proxy: ParsedProxy?, underlying: Int): Int {
+        if (s.mtuOverride > 0) return s.mtuOverride.coerceIn(1200, 1500)
+        val base = when (layer) {
+            Layer.WARP, Layer.WARP_NODE -> 1280
+            Layer.DPI_ONLY -> 1400
+            else -> proxy?.mtuHint ?: 1400
+        }
+        val path = if (underlying in 1000..1600) underlying - 80 else base
+        return minOf(base, path).coerceIn(1200, 1500)
+    }
+
+    /** variant 0 = full config, higher = fewer optional core features (noise, scanner, fragmentation). */
+    fun build(layer: Layer, s: AppSettings, proxy: ParsedProxy?, variant: Int, ctx: Ctx): String {
         val endpoints = JSONArray()
         val outbounds = JSONArray().put(obj("type" to "direct", "tag" to "direct"))
+        val primary = ctx.bootstrap.firstOrNull() ?: s.dns
+
+        fun addProxy(tag: String) {
+            val p = proxy ?: error("No proxy selected")
+            val frag = if (s.fragmentStealth && variant == 0) fragmentJson(s) else null
+            val json = p.toJson(tag, frag, "dns-bootstrap", ctx.serverIp)
+            if (p.isEndpoint || json.optString("type") in ENDPOINT_TYPES) endpoints.put(json) else outbounds.put(json)
+        }
 
         val mainTag: String = when (layer) {
-            Layer.WARP -> {
-                val warp = obj("type" to "warp", "tag" to "warp", "mode" to s.warpTunnel.core)
-                if (s.noise && (s.warpTunnel == WarpTunnel.AUTO || s.warpTunnel == WarpTunnel.WG)) {
-                    warp.put(
-                        "noise", obj(
-                            "fake_packet" to obj(
-                                "enabled" to true, "mode" to "quic", "count" to "2-4", "delay" to "10-30"
-                            )
-                        )
-                    )
+            Layer.WARP, Layer.WARP_NODE -> {
+                if (layer == Layer.WARP_NODE) {
+                    if (proxy?.isEndpoint == true) error("WARP via Node needs a TCP/QUIC proxy, not WireGuard")
+                    addProxy("proxy")
                 }
-                if (s.scanner) warp.put("scanner", obj("enabled" to true, "search_noise" to s.searchNoise))
+                val warp = obj("type" to "warp", "tag" to "warp")
+                if (layer == Layer.WARP_NODE) warp.put("detour", "proxy")
+                if (variant <= 1) warp.put("mode", s.warpTunnel.core)
+                if (variant == 0 && s.noise && (s.warpTunnel == WarpTunnel.AUTO || s.warpTunnel == WarpTunnel.WG)) {
+                    warp.put("noise", obj("fake_packet" to obj("enabled" to true, "mode" to "quic", "count" to "2-4", "delay" to "10-30")))
+                }
+                if (variant <= 1 && s.scanner && layer == Layer.WARP) warp.put("scanner", obj("enabled" to true, "search_noise" to s.searchNoise))
                 endpoints.put(warp)
                 "warp"
             }
-            Layer.STEALTH -> {
-                val p = profile ?: error("No Stealth profile. Add one in Profiles.")
-                if (p.kind == "vless") {
-                    val link = VlessLink.parse(p.data)
-                    outbounds.put(link.toOutbound("proxy", if (s.fragmentStealth) fragmentJson(s) else null))
-                } else {
-                    val o = JSONObject(p.data)
-                    o.put("tag", "proxy")
-                    if (o.optString("type") in ENDPOINT_TYPES) endpoints.put(o) else {
-                        if (!o.has("domain_resolver")) o.put("domain_resolver", "dns-bootstrap")
-                        outbounds.put(o)
-                    }
-                }
+            Layer.NODE, Layer.MY_SERVER -> {
+                addProxy("proxy")
                 "proxy"
             }
-            Layer.LIGHT -> {
-                outbounds.put(obj("type" to "direct", "tag" to "frag", "tls_fragment" to fragmentJson(s)))
+            Layer.DPI_ONLY -> {
+                outbounds.put(
+                    if (variant == 0) obj("type" to "direct", "tag" to "frag", "tls_fragment" to fragmentJson(s))
+                    else obj("type" to "direct", "tag" to "frag")
+                )
                 "frag"
             }
         }
 
-        // DNS: everything the apps ask is answered over encrypted DNS through the active tunnel.
+        // DNS: apps' queries are answered over encrypted DNS through the active tunnel. The bootstrap resolver (used
+        // only to find server names) is the fastest working IP-literal DoH server, chosen app-side from the chain
+        // Cloudflare / Quad9 / AdGuard / Google, so a blocked 1.1.1.1 never prevents start-up.
         val remote = obj(
             "type" to "https", "tag" to "dns-remote", "server" to s.dns.server,
             "server_port" to 443, "path" to "/dns-query", "detour" to mainTag
         )
         s.dns.sni?.let { remote.put("tls", obj("server_name" to it)) }
         val bootstrap = obj(
-            "type" to "https", "tag" to "dns-bootstrap", "server" to "1.1.1.1",
+            "type" to "https", "tag" to "dns-bootstrap", "server" to primary.server,
             "server_port" to 443, "path" to "/dns-query"
         )
+        primary.sni?.let { bootstrap.put("tls", obj("server_name" to it)) }
         val dns = obj(
             "servers" to JSONArray().put(remote).put(bootstrap),
             "final" to "dns-remote",
@@ -80,6 +120,8 @@ object ConfigBuilder {
         val rules = JSONArray()
         rules.put(obj("action" to "sniff"))
         rules.put(obj("protocol" to "dns", "action" to "hijack-dns"))
+        rules.put(obj("port" to 53, "action" to "hijack-dns"))
+        if (blockQuic(s, layer, proxy)) rules.put(obj("network" to "udp", "port" to 443, "action" to "reject"))
         if (s.ipv6 == Ipv6Mode.BLOCK) rules.put(obj("ip_version" to 6, "action" to "reject"))
         rules.put(obj("ip_is_private" to true, "outbound" to "direct"))
 
@@ -94,7 +136,7 @@ object ConfigBuilder {
         val tun = obj(
             "type" to "tun", "tag" to "tun-in",
             "address" to arr("172.19.0.1/30", "fdfe:dcba:9876::1/126"),
-            "mtu" to s.mtu,
+            "mtu" to tunMtu(s, layer, proxy, ctx.underlyingMtu),
             "auto_route" to true,
             "strict_route" to true,
             "stack" to "mixed"

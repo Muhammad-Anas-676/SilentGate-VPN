@@ -2,7 +2,7 @@ package com.silentgatevpn.app.legal
 
 object LegalDocs {
 
-    const val UPDATED = "19 November 2026"
+    const val UPDATED = "20 November 2026"
     const val CONTACT = "[CONTACT: add your support email or GitHub Issues link here before publishing]"
 
     val privacy = LegalDoc(
@@ -20,6 +20,7 @@ Last updated: $UPDATED. Applies to SilentGate VPN ("the App", "we", "us").
 # 1. Data stored on your device
 - Your settings (connection mode, DNS provider, split-tunnelling list, fragmentation values).
 - Stealth profiles you import, including the server address and credentials inside them.
+- A cached list of community proxy nodes and the subscription URLs you or the App added, with simple success/failure counters per node.
 - Cloudflare WARP device credentials created by the networking core so the tunnel can reconnect.
 - A short in-memory log of connection events, cleared when the App closes.
 - The time and version of your acceptance of our legal documents.
@@ -34,6 +35,8 @@ When you connect or use the Tools tab, your device contacts third parties direct
 - The encrypted DNS provider you select (Cloudflare, Quad9 or AdGuard).
 - Diagnostic services used by the Tools tab and exit check: ipwho.is, edns.ip-api.com and api6.ipify.org. These see the IP address of your VPN exit, not your real address, when the tunnel is up.
 - Any server named in a Stealth profile you import.
+- Public subscription hosts (for example GitHub or the jsDelivr CDN) that serve the community node lists, and the community nodes themselves when you connect through one. Community nodes are run by third parties: they can see which servers you contact and when, and the App cannot control or audit them. Do not rely on them for highly sensitive activity.
+- Public DNS-over-HTTPS resolvers (Cloudflare, Quad9, AdGuard, Google) contacted directly to look up server names before the tunnel starts.
 Those parties receive the information needed to answer the request and may log it under their own policies.
 
 # 4. Permissions
@@ -84,6 +87,7 @@ The App is provided free of charge. There is no service-level commitment. Featur
 There is no account. You are responsible for your device, your Stealth profiles and credentials, and everything you do while connected.
 
 # 5. Third-party services
+Community proxy nodes are free servers published by third parties. They may be slow, unavailable, logging or malicious. The App only keeps nodes that use encryption and certificate checks and verifies the exit location before showing "Protected", but it cannot guarantee that a node is trustworthy.
 The tunnel depends on services that the developer does not control. Their availability, speed, terms and policies are theirs. See the Third-Party Services notice.
 
 # 6. Your own servers and Workers

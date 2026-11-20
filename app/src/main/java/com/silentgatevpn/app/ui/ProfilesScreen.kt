@@ -42,6 +42,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material.icons.rounded.Refresh
+import kotlinx.coroutines.launch
+import com.silentgatevpn.app.vpn.NodePool
 import com.silentgatevpn.app.vpn.Profile
 import com.silentgatevpn.app.vpn.ProfileStore
 import com.silentgatevpn.app.vpn.SettingsStore
@@ -53,14 +59,64 @@ fun ProfilesScreen() {
     var showAdd by remember { mutableStateOf(false) }
     var guide by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    val subs by NodePool.subs.collectAsState()
+    val pool by NodePool.nodes.collectAsState()
+    val busy by NodePool.refreshing.collectAsState()
+    val poolMsg by NodePool.lastRefreshMessage.collectAsState()
+    var showSub by remember { mutableStateOf(false) }
+    var showLinks by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         Text("Profiles", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 16.dp))
         Text(
-            "WARP needs no setup. Stealth profiles are your own VLESS or WireGuard/AmneziaWG servers, used as the backup layer or for switching exit countries.",
+            "Smart Auto needs no setup: it uses community nodes in safe countries. Add your own server for a trusted exit, or extra subscriptions for more nodes.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp)
         )
+
+        SectionTitle("Community nodes")
+        SgCardBox {
+            ToggleRow(
+                "Use community nodes",
+                "Free third-party servers (VLESS Reality, Trojan, Hysteria2, TUIC, Shadowsocks). They are encrypted but run by strangers: do not log in to sensitive accounts over them. Insecure nodes are dropped and every exit is verified.",
+                settings.communityNodes
+            ) { v -> SettingsStore.update { it.copy(communityNodes = v) } }
+            Spacer(Modifier.height(6.dp))
+            InfoLine("Nodes ready", pool.size.toString())
+            if (poolMsg.isNotEmpty()) Text(poolMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { scope.launch { NodePool.refresh() } }, enabled = !busy) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.size(6.dp))
+                    Text(if (busy) "Updating…" else "Refresh")
+                }
+                OutlinedButton(onClick = { showLinks = true }) { Text("Import links") }
+            }
+        }
+        SectionTitle("Subscriptions")
+        subs.forEach { sub ->
+            SgCardBox(Modifier.padding(bottom = 8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(sub.name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                        Text(
+                            (if (sub.count > 0) "${sub.count} nodes" else "not loaded yet") + if (sub.builtin) " · built in" else "",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = sub.enabled, onCheckedChange = { NodePool.setSubscriptionEnabled(sub.url, it) },
+                        colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SgGreen)
+                    )
+                    IconButton(onClick = { NodePool.removeSubscription(sub.url) }) {
+                        Icon(Icons.Rounded.Delete, contentDescription = "Remove", tint = SgDanger)
+                    }
+                }
+            }
+        }
+        OutlinedButton(onClick = { showSub = true }, modifier = Modifier.fillMaxWidth()) { Text("Add subscription URL") }
 
         SectionTitle("Built in")
         SgCardBox {
@@ -72,9 +128,9 @@ fun ProfilesScreen() {
             )
         }
 
-        SectionTitle("Stealth profiles")
+        SectionTitle("My servers")
         if (profiles.isEmpty()) {
-            SgCardBox { Text("No profiles yet. Add a vless:// link or a custom JSON profile.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            SgCardBox { Text("No profiles yet. Add a vless://, trojan://, hysteria2://, tuic://, ss:// or wg:// link, or a custom JSON profile.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
         val activeId = ProfileStore.active()?.id
         profiles.forEach { p: Profile ->
@@ -133,6 +189,71 @@ fun ProfilesScreen() {
         MadeByAnas()
     }
 
+
+    if (showSub) {
+        var url by remember { mutableStateOf("") }
+        var err by remember { mutableStateOf<String?>(null) }
+        AlertDialog(
+            onDismissRequest = { showSub = false },
+            containerColor = Color(0xFF121212),
+            title = { Text("Add subscription") },
+            text = {
+                Column {
+                    Text("An https:// link to a Base64, plain-link, sing-box JSON or Clash YAML list.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedTextField(
+                        value = url, onValueChange = { url = it; err = null }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp), placeholder = { Text("https://...") },
+                        isError = err != null,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = SgGreen, unfocusedBorderColor = Color(0xFF3A3A3A),
+                            focusedTextColor = Color.White, unfocusedTextColor = Color.White, cursorColor = SgGreen
+                        )
+                    )
+                    err?.let { Text(it, color = SgDanger, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp)) }
+                    TextButton(onClick = { clipboard.getText()?.text?.let { url = it.trim() } }) { Text("Paste from clipboard", color = SgGreen) }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val e = NodePool.addSubscription(url)
+                    if (e == null) { showSub = false; scope.launch { NodePool.refresh() } } else err = e
+                }) { Text("Add", color = SgGreen) }
+            },
+            dismissButton = { TextButton(onClick = { showSub = false }) { Text("Cancel", color = Color.White) } }
+        )
+    }
+
+    if (showLinks) {
+        var text by remember { mutableStateOf("") }
+        var msg by remember { mutableStateOf<String?>(null) }
+        AlertDialog(
+            onDismissRequest = { showLinks = false },
+            containerColor = Color(0xFF121212),
+            title = { Text("Import links") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = text, onValueChange = { text = it; msg = null }, minLines = 5, maxLines = 9,
+                        modifier = Modifier.fillMaxWidth(), placeholder = { Text("Paste one or many links, a Base64 blob, sing-box JSON or Clash YAML") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = SgGreen, unfocusedBorderColor = Color(0xFF3A3A3A),
+                            focusedTextColor = Color.White, unfocusedTextColor = Color.White, cursorColor = SgGreen
+                        )
+                    )
+                    msg?.let { Text(it, color = SgGreen, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp)) }
+                    TextButton(onClick = { clipboard.getText()?.text?.let { text = it } }) { Text("Paste from clipboard", color = SgGreen) }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val n = NodePool.importText(text)
+                    if (n > 0) showLinks = false else msg = "No usable nodes found in that text"
+                }) { Text("Import", color = SgGreen) }
+            },
+            dismissButton = { TextButton(onClick = { showLinks = false }) { Text("Cancel", color = Color.White) } }
+        )
+    }
+
     if (showAdd) {
         var text by remember { mutableStateOf("") }
         var error by remember { mutableStateOf<String?>(null) }
@@ -144,7 +265,7 @@ fun ProfilesScreen() {
                 Column {
                     OutlinedTextField(
                         value = text, onValueChange = { text = it; error = null }, minLines = 4, maxLines = 8,
-                        modifier = Modifier.fillMaxWidth(), placeholder = { Text("vless://... or {\"type\":\"vless\", ...}") },
+                        modifier = Modifier.fillMaxWidth(), placeholder = { Text("vless:// trojan:// hy2:// tuic:// ss:// wg:// or JSON") },
                         isError = error != null,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = SgGreen, unfocusedBorderColor = Color(0xFF3A3A3A),
