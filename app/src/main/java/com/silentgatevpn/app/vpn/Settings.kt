@@ -18,6 +18,12 @@ enum class ConnectMode(val label: String, val hint: String) {
     DPI_ONLY("DPI only", "Unblocks filtered sites with TLS fragmentation. It does NOT hide your IP address or country.")
 }
 
+/** The two engines offered on Home: the existing Smart Auto flow (default) or your own Shadowsocks server. */
+enum class Engine(val label: String, val hint: String) {
+    DEFAULT("Smart Auto", "Default · private server, nodes, WARP"),
+    SHADOWSOCKS("Shadowsocks", "Your own ss:// server · light")
+}
+
 enum class QuicMode(val label: String) { AUTO("Smart"), BLOCK("Block QUIC"), ALLOW("Allow QUIC") }
 
 enum class WarpTunnel(val label: String, val core: String) {
@@ -70,6 +76,8 @@ data class AppSettings(
     val quic: QuicMode = QuicMode.BLOCK,
     /** Try the private (built-in or user supplied) primary server before anything else in Smart Auto. */
     val primaryFirst: Boolean = true,
+    /** Chosen on Home. DEFAULT keeps every existing behaviour; SHADOWSOCKS connects only to the user's ss:// server. */
+    val engine: Engine = Engine.DEFAULT,
     val schema: Int = SETTINGS_SCHEMA
 ) {
     val consented: Boolean get() = consentVersion >= CONSENT_VERSION
@@ -97,6 +105,7 @@ data class AppSettings(
         put("allowHomeExit", allowHomeExit)
         put("quic", quic.name)
         put("primaryFirst", primaryFirst)
+        put("engine", engine.name)
         put("schema", schema)
     }
 
@@ -135,6 +144,7 @@ data class AppSettings(
                 allowHomeExit = o.optBoolean("allowHomeExit", d.allowHomeExit),
                 quic = if (migrate) (if (savedQuic == QuicMode.ALLOW) QuicMode.ALLOW else QuicMode.BLOCK) else savedQuic,
                 primaryFirst = o.optBoolean("primaryFirst", d.primaryFirst),
+                engine = o.enumOr("engine", d.engine),
                 schema = SETTINGS_SCHEMA
             )
         }

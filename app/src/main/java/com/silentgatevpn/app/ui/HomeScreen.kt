@@ -21,14 +21,19 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -48,6 +53,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import android.content.Intent
@@ -55,6 +61,8 @@ import android.provider.Settings
 import androidx.compose.ui.platform.LocalContext
 import com.silentgatevpn.app.R
 import com.silentgatevpn.app.vpn.ConnectMode
+import com.silentgatevpn.app.vpn.Engine
+import com.silentgatevpn.app.vpn.ShadowsocksServer
 import com.silentgatevpn.app.vpn.Geo
 import com.silentgatevpn.app.vpn.Net
 import com.silentgatevpn.app.vpn.NodePool
@@ -84,6 +92,9 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
     val alwaysOnHint by VpnState.alwaysOnHint.collectAsState()
     val context = LocalContext.current
     var showPicker by remember { mutableStateOf(false) }
+    val ssSummary by ShadowsocksServer.summary.collectAsState()
+    var ssHint by remember { mutableStateOf(false) }
+    val ssEngine = settings.engine == Engine.SHADOWSOCKS
 
     val connected = status == Status.CONNECTED
     val idle = status == Status.DISCONNECTED || status == Status.ERROR
@@ -116,10 +127,22 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
             Text("SilentGate VPN", style = MaterialTheme.typography.titleLarge)
         }
 
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(16.dp))
+        EngineSelector(settings.engine, enabled = idle) { e ->
+            ssHint = false
+            SettingsStore.update { it.copy(engine = e) }
+        }
+
+        Spacer(Modifier.height(20.dp))
         ConnectButton(status = status, warn = warn, onClick = {
             when (status) {
-                Status.DISCONNECTED, Status.ERROR -> onConnect()
+                Status.DISCONNECTED, Status.ERROR ->
+                    if (ssEngine && ssSummary == null) {
+                        ssHint = true
+                    } else {
+                        ssHint = false
+                        onConnect()
+                    }
                 Status.CONNECTED, Status.CONNECTING -> onDisconnect()
                 Status.DISCONNECTING -> Unit
             }
@@ -145,8 +168,8 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
         )
         Text(
             when (status) {
-                Status.DISCONNECTED -> "Tap the button to connect"
-                Status.CONNECTING -> "Finding the fastest server…"
+                Status.DISCONNECTED -> if (ssEngine) "Tap the button to connect to your server" else "Tap the button to connect"
+                Status.CONNECTING -> if (ssEngine) "Connecting to your Shadowsocks server…" else "Finding the fastest server…"
                 Status.CONNECTED -> "Your connection is private"
                 Status.DISCONNECTING -> ""
                 Status.ERROR -> "Check your internet and try again"
@@ -170,7 +193,7 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
             connected && protection == Protection.DPI_ONLY -> "Unblock-only mode" to "Your IP address is not hidden in this mode. You can change it in Settings › Advanced."
             connected && protection == Protection.GEO_LOCAL -> "Nearby location" to "Your IP is hidden, but this location is close to yours, so sites may show local content."
             idle && alwaysOnHint -> "Always-on VPN is on" to "Android may keep the VPN icon or reconnect by itself. Turn it off in Android Settings › Network › VPN."
-            idle && settings.mode != ConnectMode.AUTO -> "Advanced mode on" to "${settings.mode.label} is selected in Settings › Advanced. Switch back to Smart Auto for the normal 1-tap experience."
+            idle && !ssEngine && settings.mode != ConnectMode.AUTO -> "Advanced mode on" to "${settings.mode.label} is selected in Settings › Advanced. Switch back to Smart Auto for the normal 1-tap experience."
             else -> null
         }
         if (notice != null) {
@@ -196,7 +219,16 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
         }
 
         Spacer(Modifier.height(24.dp))
-        SgCardBox(Modifier.clickable(enabled = idle, role = Role.Button, onClickLabel = "Choose location") { showPicker = true }) {
+        if (ssEngine) {
+            ShadowsocksCard(ssSummary, idle, showHint = ssHint, onSaved = { ssHint = false })
+            if (connected && connectedCc.isNotEmpty()) {
+                Text(
+                    "Connected: ${Geo.flag(connectedCc)} ${Geo.name(connectedCc)}",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+        } else SgCardBox(Modifier.clickable(enabled = idle, role = Role.Button, onClickLabel = "Choose location") { showPicker = true }) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Location", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -267,6 +299,84 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
             },
             confirmButton = { TextButton(onClick = { showPicker = false }) { Text("Close", color = SgGreen) } }
         )
+    }
+}
+
+@Composable
+private fun EngineSelector(selected: Engine, enabled: Boolean, onSelect: (Engine) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Engine.entries.forEach { e ->
+            val sel = e == selected
+            val shape = RoundedCornerShape(16.dp)
+            Column(
+                Modifier.weight(1f)
+                    .alpha(if (enabled) 1f else 0.55f)
+                    .clip(shape)
+                    .background(if (sel) Color(0xFF0F2A1B) else SgCard)
+                    .border(1.5.dp, if (sel) SgGreen else Color(0xFF3A3A3A), shape)
+                    .clickable(enabled = enabled, role = Role.RadioButton) { onSelect(e) }
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        e.label, style = MaterialTheme.typography.titleMedium,
+                        color = if (sel) SgGreen else Color.White, modifier = Modifier.weight(1f)
+                    )
+                    if (sel) Text("✓", color = SgGreen, style = MaterialTheme.typography.titleMedium)
+                }
+                Text(e.hint, style = MaterialTheme.typography.bodySmall, color = SgTextDim, modifier = Modifier.padding(top = 2.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShadowsocksCard(summary: String?, idle: Boolean, showHint: Boolean, onSaved: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    var editing by remember(summary) { mutableStateOf(summary == null) }
+    var text by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    SgCardBox(border = if (showHint && summary == null) SgOrange else MaterialTheme.colorScheme.outlineVariant) {
+        Text("Shadowsocks server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (summary != null && !editing) {
+            Text(summary, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 2.dp))
+            Row {
+                TextButton(enabled = idle, onClick = { editing = true }) { Text("Change", color = if (idle) SgGreen else SgTextDim) }
+                TextButton(enabled = idle, onClick = { ShadowsocksServer.clear() }) { Text("Remove", color = if (idle) SgOrange else SgTextDim) }
+            }
+        } else {
+            Text(
+                if (showHint && summary == null) "Add your ss:// link first, then tap the power button."
+                else "Paste your ss:// link. It is saved encrypted on this phone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (showHint && summary == null) SgOrange else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+            OutlinedTextField(
+                value = text, onValueChange = { text = it; error = null }, minLines = 2, maxLines = 4,
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                placeholder = { Text("ss://…", color = Color(0xFF8A8A8A)) },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                isError = error != null,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = SgGreen, unfocusedBorderColor = Color(0xFF6A6A6A),
+                    focusedTextColor = Color.White, unfocusedTextColor = Color.White, cursorColor = SgGreen
+                )
+            )
+            error?.let { Text(it, color = Color(0xFFFFB4AB), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp)) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { clipboard.getText()?.text?.let { text = it; error = null } }) {
+                    Icon(Icons.Rounded.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp), tint = SgGreen)
+                    Spacer(Modifier.size(6.dp))
+                    Text("Paste", color = SgGreen)
+                }
+                TextButton(enabled = idle && text.isNotBlank(), onClick = {
+                    val e = ShadowsocksServer.set(text)
+                    if (e == null) { text = ""; error = null; editing = false; onSaved() } else error = e
+                }) { Text("Save", color = if (idle && text.isNotBlank()) SgGreen else SgTextDim) }
+                if (summary != null) TextButton(onClick = { editing = false; text = ""; error = null }) { Text("Cancel", color = SgTextDim) }
+            }
+        }
     }
 }
 

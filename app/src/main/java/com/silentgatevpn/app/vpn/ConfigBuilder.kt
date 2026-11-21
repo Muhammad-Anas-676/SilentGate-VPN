@@ -10,6 +10,7 @@ object ConfigBuilder {
     /** [masksIp] decides whether the app may ever show "Protected" for this layer. */
     enum class Layer(val title: String, val timeoutMs: Long, val masksIp: Boolean) {
         PRIMARY("Private server", 12_000, true),
+        SHADOWSOCKS("Shadowsocks", 12_000, true),
         NODE("Smart Node", 9_500, true),
         MY_SERVER("My server", 15_000, true),
         WARP("Obfuscated WARP", 30_000, true),
@@ -34,7 +35,7 @@ object ConfigBuilder {
     /** How many progressively simpler configs exist for a layer (used when the core rejects an option). */
     fun variants(layer: Layer): Int = when (layer) {
         Layer.WARP, Layer.WARP_NODE -> 3
-        Layer.PRIMARY, Layer.NODE, Layer.MY_SERVER, Layer.DPI_ONLY -> 2
+        Layer.PRIMARY, Layer.SHADOWSOCKS, Layer.NODE, Layer.MY_SERVER, Layer.DPI_ONLY -> 2
     }
 
     /**
@@ -60,11 +61,12 @@ object ConfigBuilder {
         }
         val path = if (underlying in 1000..1600) underlying - 80 else base
         val auto = minOf(base, path)
+        // Old / budget phones: a smaller MTU avoids carrier fragmentation drops on 2016 to 2018 mobile chipsets.
         val capped = if (SilentGateApp.isLowEndDevice) minOf(auto, LOW_END_MTU) else auto
         return capped.coerceIn(1200, 1500)
     }
 
-    private const val LOW_END_MTU = 1280
+    private const val LOW_END_MTU = 1340
 
     /** variant 0 = full config, higher = fewer optional core features (noise, scanner, fragmentation). */
     fun build(layer: Layer, s: AppSettings, proxy: ParsedProxy?, variant: Int, ctx: Ctx): String {
@@ -74,6 +76,9 @@ object ConfigBuilder {
 
         fun addProxy(tag: String) {
             val p = proxy ?: error("No proxy selected")
+            // tls_fragment is applied to proxy handshakes ONLY when the user switched it on in Advanced settings.
+            // (DPI_ONLY fragments its own "frag" outbound below.) It is off by default because splitting every
+            // proxy TLS hello makes dozens of parallel media connections slow or get reset.
             val frag = if (s.fragmentStealth && variant == 0) fragmentJson(s) else null
             val json = p.toJson(tag, frag, "dns-bootstrap", ctx.serverIp)
             if (p.isEndpoint || json.optString("type") in ENDPOINT_TYPES) endpoints.put(json) else outbounds.put(json)
@@ -95,7 +100,7 @@ object ConfigBuilder {
                 endpoints.put(warp)
                 "warp"
             }
-            Layer.NODE, Layer.MY_SERVER, Layer.PRIMARY -> {
+            Layer.NODE, Layer.MY_SERVER, Layer.PRIMARY, Layer.SHADOWSOCKS -> {
                 addProxy("proxy")
                 "proxy"
             }
@@ -108,6 +113,9 @@ object ConfigBuilder {
             }
         }
 
+        // DNS: apps' queries are answered over encrypted DNS through the active tunnel. The bootstrap resolver (used
+        // only to find server names) is the fastest working IP-literal DoH server, chosen app-side from the chain
+        // Cloudflare / Quad9 / AdGuard / Google, so a blocked 1.1.1.1 never prevents start-up.
         val remote = obj(
             "type" to "https", "tag" to "dns-remote", "server" to s.dns.server,
             "server_port" to 443, "path" to "/dns-query", "detour" to mainTag
@@ -132,24 +140,25 @@ object ConfigBuilder {
         if (s.ipv6 == Ipv6Mode.BLOCK) rules.put(obj("ip_version" to 6, "action" to "reject"))
         rules.put(obj("ip_is_private" to true, "outbound" to "direct"))
 
-        val isLegacyAndroid = Build.VERSION.SDK_INT < 29
         val route = obj(
             "rules" to rules,
             "final" to mainTag,
-            "auto_detect_interface" to !isLegacyAndroid,
+            "auto_detect_interface" to true,
             "default_domain_resolver" to obj("server" to "dns-bootstrap", "strategy" to "ipv4_only")
         )
 
-        val stackMode = if (isLegacyAndroid || SilentGateApp.isLowEndDevice || variant >= 1) "gvisor" else "mixed"
-
+        // IPv6 address + ::/0 route always go into the TUN so native IPv6 can never bypass the VPN.
         val tun = obj(
             "type" to "tun", "tag" to "tun-in",
             "address" to arr("172.19.0.1/30", "fdfe:dcba:9876::1/126"),
             "mtu" to tunMtu(s, layer, proxy, ctx.underlyingMtu),
             "auto_route" to true,
-            // On Android 8.1 / Go Edition, strict_route causes kernel-level packet drops when combined with gVisor
-            "strict_route" to !isLegacyAndroid,
-            "stack" to stackMode
+            // strict_route is ALWAYS on (API 24+). With it off, libbox hands openTun() an EMPTY DNS server list, the
+            // VpnService interface ends up with no resolver and every in-tunnel probe dies with "no traffic".
+            "strict_route" to true,
+            // "mixed" is proven to pass VLESS traffic on Android 7 to 8 (SilentGateApp enables fixAndroidStack for
+            // API 24..28). Pure gVisor is only a fallback, reached when variant 0 was rejected by the core.
+            "stack" to if (variant >= 1 && Build.VERSION.SDK_INT < 29) "gvisor" else "mixed"
         )
         if (s.splitPackages.isNotEmpty()) {
             when (s.splitMode) {
