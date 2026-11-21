@@ -1,6 +1,7 @@
 package com.silentgatevpn.app.vpn
 
 import android.os.Build
+import com.silentgatevpn.app.SilentGateApp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -33,6 +34,12 @@ object Prober {
     private const val BURST_EXTRA = 4      // parallel handshakes after the first one succeeded
     private const val BURST_MIN_OK = 3     // of BURST_EXTRA
 
+    // Budget phones / Android 7.0 to 9: fewer parallel sockets and a more forgiving time limit, so a slow CPU does
+    // not mark a reachable node as THROTTLED.
+    private const val LOW_BURST_EXTRA = 2
+    private const val LOW_BURST_MIN_OK = 2
+    private const val LOW_TIMEOUT_MS = 3_200
+
     /**
      * Returns latency in ms of the first handshake, [UNTESTED] for UDP based nodes (cannot be tested without the
      * core), -1 when unreachable, or [THROTTLED] when the parallel burst fails.
@@ -43,13 +50,18 @@ object Prober {
         if (n.udp && n.transport == "udp") return@withContext UNTESTED
         val ip = Net.resolveHost(n.server) ?: return@withContext -1L
 
-        val first = gated(gate) { handshake(n, ip, timeoutMs) }
+        val low = SilentGateApp.isLowEndDevice
+        val t = if (low) maxOf(timeoutMs, LOW_TIMEOUT_MS) else timeoutMs
+        val extra = if (low) LOW_BURST_EXTRA else BURST_EXTRA
+        val minOk = if (low) LOW_BURST_MIN_OK else BURST_MIN_OK
+
+        val first = gated(gate) { handshake(n, ip, t) }
         if (first < 0) return@withContext -1L
 
         val burst = coroutineScope {
-            (1..BURST_EXTRA).map { async(Dispatchers.IO) { gated(gate) { handshake(n, ip, timeoutMs) } } }.awaitAll()
+            (1..extra).map { async(Dispatchers.IO) { gated(gate) { handshake(n, ip, t) } } }.awaitAll()
         }
-        if (burst.count { it >= 0 } < BURST_MIN_OK) return@withContext THROTTLED
+        if (burst.count { it >= 0 } < minOk) return@withContext THROTTLED
         first
     }
 
@@ -59,9 +71,10 @@ object Prober {
     /** One connection: TCP connect (+ TLS handshake for plain TLS nodes). Returns elapsed ms, or -1 on failure. */
     private fun handshake(n: Node, ip: String, timeoutMs: Int): Long {
         val t0 = System.currentTimeMillis()
-        // Android 7.0 (API 24) ships an old CA store that rejects many modern certificates. Pre-flight is only a
-        // reachability test, so on API 24 it stops at the TCP connect; sing-box still verifies the certificate itself.
-        val plainTls = n.security == "tls" && n.transport != "udp" && Build.VERSION.SDK_INT >= 25
+        // Android 7.0 to 9 (API 24-28) ship an old CA store and TLS stack that reject many modern certificates.
+        // Pre-flight is only a reachability test, so below Android 10 it stops at the TCP connect; sing-box (libbox)
+        // still verifies the certificate itself when the tunnel really connects.
+        val plainTls = n.security == "tls" && n.transport != "udp" && Build.VERSION.SDK_INT >= 29
         return runCatching {
             Socket().use { s ->
                 s.connect(InetSocketAddress(ip, n.port), timeoutMs)

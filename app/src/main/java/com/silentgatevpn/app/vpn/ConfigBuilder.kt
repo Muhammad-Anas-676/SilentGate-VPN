@@ -1,5 +1,7 @@
 package com.silentgatevpn.app.vpn
 
+import android.os.Build
+import com.silentgatevpn.app.SilentGateApp
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -57,8 +59,13 @@ object ConfigBuilder {
             else -> proxy?.mtuHint ?: 1400
         }
         val path = if (underlying in 1000..1600) underlying - 80 else base
-        return minOf(base, path).coerceIn(1200, 1500)
+        val auto = minOf(base, path)
+        // Old / budget phones: a smaller MTU avoids carrier fragmentation drops on 2016 to 2018 mobile chipsets.
+        val capped = if (SilentGateApp.isLowEndDevice) minOf(auto, LOW_END_MTU) else auto
+        return capped.coerceIn(1200, 1500)
     }
+
+    private const val LOW_END_MTU = 1340
 
     /** variant 0 = full config, higher = fewer optional core features (noise, scanner, fragmentation). */
     fun build(layer: Layer, s: AppSettings, proxy: ParsedProxy?, variant: Int, ctx: Ctx): String {
@@ -146,7 +153,9 @@ object ConfigBuilder {
             "mtu" to tunMtu(s, layer, proxy, ctx.underlyingMtu),
             "auto_route" to true,
             "strict_route" to true,
-            "stack" to "mixed"
+            // Android 7.0 to 9 kernels (MediaTek budget phones especially) stall with the native "system" TCP path that
+            // "mixed" uses; the pure userspace gVisor stack is reliable there.
+            "stack" to if (Build.VERSION.SDK_INT < 29) "gvisor" else "mixed"
         )
         if (s.splitPackages.isNotEmpty()) {
             when (s.splitMode) {

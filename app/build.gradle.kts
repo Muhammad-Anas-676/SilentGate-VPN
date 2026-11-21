@@ -48,6 +48,8 @@ android {
 
 dependencies {
     implementation(files("libs/libbox.aar"))
+    // Bundled TLS 1.3 stack (no Google Play Services; ships arm64-v8a and armeabi-v7a natives) for Android 7.0 to 8.1.
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
 
     val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
     implementation(composeBom)

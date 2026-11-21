@@ -1,5 +1,6 @@
 package com.silentgatevpn.app.vpn
 
+import com.silentgatevpn.app.SilentGateApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -292,10 +293,27 @@ object Net {
         "https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
     )
 
+    // Four small, diverse hosts for old / low-RAM phones (Android 7.0 to 9, 2 GB): the same idea with a third of the
+    // sockets, so the CPU and the radio are not what fails the test.
+    private val LOW_END_MEDIA_PROBES = listOf(
+        "https://www.gstatic.com/generate_204",
+        "https://www.google.com/favicon.ico",
+        "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js",
+        "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"
+    )
+
+    private val lowEnd: Boolean get() = SilentGateApp.isLowEndDevice
+
     // Thresholds of the concurrent media test (tuned for budget phones on mobile data).
-    private const val MEDIA_MIN_OK = 6               // of 8 parallel fetches
-    private const val MEDIA_MAX_MEDIAN_MS = 3_500L   // slower than this = overloaded node
-    private const val EXIT_MAX_RTT_MS = 3_500L       // trace round trip through the node
+    private val mediaProbes: List<String> get() = if (lowEnd) LOW_END_MEDIA_PROBES else MEDIA_PROBES
+    private val mediaMinOk: Int get() = if (lowEnd) 3 else 6                         // of 4 / of 8 parallel fetches
+    private val mediaMaxMedianMs: Long get() = if (lowEnd) 5_000L else 3_500L        // slower = overloaded node
+    private val exitMaxRttMs: Long get() = if (lowEnd) 5_000L else 3_500L            // trace round trip through the node
+    private val mediaTimeoutMs: Int get() = if (lowEnd) 8_000 else 6_000
+
+    /** In-session watchdog: seconds between checks, and how many of its probes must answer for "healthy". */
+    val healthEverySecs: Int get() = if (lowEnd) 15 else 10
+    val healthMinOk: Int get() = if (lowEnd) 1 else 2
 
     // Mainstream uncensored endpoints that family-filter DNS, cloud WAFs and ISP blocklists commonly hit. Only
     // /robots.txt is requested (a few hundred bytes of text); a node is rejected only when ALL of them are blocked
@@ -353,7 +371,7 @@ object Net {
      * Failures count as the full timeout so the percentile reflects a stalled node honestly.
      */
     suspend fun mediaBurst(
-        urls: List<String> = MEDIA_PROBES, timeoutMs: Int = 6000, maxBytes: Int = 16 * 1024
+        urls: List<String> = mediaProbes, timeoutMs: Int = mediaTimeoutMs, maxBytes: Int = 16 * 1024
     ): MediaResult = coroutineScope {
         val times = urls.map { u -> async(Dispatchers.IO) { timedFetch(u, timeoutMs, maxBytes) } }.awaitAll()
         val okTimes = times.filter { it >= 0 }
@@ -365,9 +383,9 @@ object Net {
         )
     }
 
-    /** Small, cheap version for the in-session watchdog: 4 parallel fetches of 2 KB each. */
+    /** Small, cheap version for the in-session watchdog: 4 parallel fetches of 2 KB (2 on low-end phones). */
     suspend fun health(timeoutMs: Int = 5000): MediaResult =
-        mediaBurst(MEDIA_PROBES.shuffled().take(4), timeoutMs, 2048)
+        mediaBurst(mediaProbes.shuffled().take(if (lowEnd) 2 else 4), timeoutMs, 2048)
 
     private fun looksPoisoned(a: InetAddress): Boolean =
         a.isAnyLocalAddress || a.isLoopbackAddress || a.isSiteLocalAddress || a.isLinkLocalAddress
@@ -435,7 +453,7 @@ object Net {
 
     /**
      * Gate for "Connected". The exit IP must differ from the ISP IP, the region must be allowed, and, when [enforce]
-     * is true, the exit must also survive three real-world tests: 6 of 8 parallel CDN fetches with a sane median time
+     * is true, the exit must also survive three real-world tests: 6 of 8 parallel CDN fetches (3 of 4 on low-end phones) with a sane median time
      * (no throttling of concurrent connections), a content-filter / WAF check, and a latency ceiling.
      * [enforce] = false only records the result (used for WARP, which is Cloudflare itself).
      */
@@ -461,12 +479,12 @@ object Net {
                 return v(false, "exit is ${Geo.name(cc)}, you asked for ${Geo.name(wantCc)}")
             }
             if (!enforce) return v(true, "")
-            if (t.rttMs > EXIT_MAX_RTT_MS) return v(false, "exit is too slow (${t.rttMs} ms to reach the location check)")
+            if (t.rttMs > exitMaxRttMs) return v(false, "exit is too slow (${t.rttMs} ms to reach the location check)")
             val m = mediaJob.await() ?: return v(false, "media test did not run")
-            if (m.ok < MEDIA_MIN_OK) {
+            if (m.ok < mediaMinOk) {
                 return v(false, "parallel media test failed: only ${m.ok} of ${m.total} CDN hosts loaded (node drops concurrent connections)", m.medianMs)
             }
-            if (m.medianMs > MEDIA_MAX_MEDIAN_MS) {
+            if (m.medianMs > mediaMaxMedianMs) {
                 return v(false, "node is overloaded: median ${m.medianMs} ms for small CDN files", m.medianMs)
             }
             val c = contentJob.await() ?: ContentResult(true, "")

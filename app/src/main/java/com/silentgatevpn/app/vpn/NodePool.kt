@@ -1,5 +1,6 @@
 package com.silentgatevpn.app.vpn
 
+import com.silentgatevpn.app.SilentGateApp
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +21,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.Socket
+import java.net.InetAddress
 import java.net.URL
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLSocketFactory
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -77,9 +83,10 @@ data class HomeInfo(val ip: String, val cc: String)
  */
 object NodePool {
 
-    private const val MAX_NODES = 360
-    private const val PER_SUB_CAP = 160
-    private const val MAX_BODY_BYTES = 3_500_000
+    // Lighter limits on 2 GB / Android 7.0 to 9 phones.
+    private val MAX_NODES: Int get() = if (SilentGateApp.isLowEndDevice) 200 else 360
+    private val PER_SUB_CAP: Int get() = if (SilentGateApp.isLowEndDevice) 80 else 160
+    private val MAX_BODY_BYTES: Int get() = if (SilentGateApp.isLowEndDevice) 1_500_000 else 3_500_000
     const val STALE_MS = 6L * 3600_000L
 
     /** Nodes whose parallel media test is slower than this are ranked far down; above [SKIP_MEDIA_MS] they cool down. */
@@ -295,33 +302,103 @@ object NodePool {
     private const val ATTEMPT_TIMEOUT_MS = 4_500
     private const val DOWNLOAD_TOTAL_MS = 20_000L
 
-    private fun fetchOne(url: String, conns: ConcurrentLinkedQueue<HttpURLConnection>): String? {
-        val c = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return null
-        conns.add(c)
-        return try {
-            c.connectTimeout = ATTEMPT_TIMEOUT_MS
-            c.readTimeout = ATTEMPT_TIMEOUT_MS
-            c.instanceFollowRedirects = true
-            c.setRequestProperty("User-Agent", "SilentGateVPN/1.2")
-            if (c.responseCode !in 200..299) return null
-            val buf = java.io.ByteArrayOutputStream()
-            c.inputStream.use { ins ->
-                val chunk = ByteArray(16 * 1024)
-                while (true) {
-                    val n = ins.read(chunk)
-                    if (n < 0) break
-                    buf.write(chunk, 0, n)
-                    if (buf.size() > MAX_BODY_BYTES) break
-                }
-            }
-            val body = buf.toString(Charsets.UTF_8.name())
-            // A CDN error page or a captive-portal page is not a feed.
-            if (body.length < 40 || body.trimStart().startsWith("<")) null else body
-        } catch (_: Exception) {
-            null
-        } finally {
-            runCatching { c.disconnect() }
+    private const val MAX_REDIRECTS = 5
+
+    /** One HTTP hop: a body, a redirect target, or nothing. [failed] = worth retrying with DoH-resolved addressing. */
+    private class Hop(val body: String? = null, val redirect: String? = null, val failed: Boolean = false)
+
+    /**
+     * Downloads one feed. First a normal request (system DNS). If that fails at the network level (ISP DNS
+     * poisoning of GitHub / jsDelivr, reset, timeout, block page) the host is resolved over DoH and the request is
+     * repeated against the IP with the real host name kept in SNI, certificate check and Host header.
+     * Redirects are followed here (https only) so every hop gets the same treatment.
+     */
+    private suspend fun fetchOne(url: String, conns: ConcurrentLinkedQueue<HttpURLConnection>): String? {
+        var current = url
+        repeat(MAX_REDIRECTS) {
+            var hop = hopDirect(current, conns)
+            if (hop.failed) hop = hopViaDoh(current, conns)
+            val body = hop.body
+            if (body != null) return body
+            current = hop.redirect ?: return null
         }
+        return null
+    }
+
+    private fun hopDirect(url: String, conns: ConcurrentLinkedQueue<HttpURLConnection>): Hop {
+        val base = runCatching { URL(url) }.getOrNull() ?: return Hop()
+        val c = runCatching { base.openConnection() as HttpURLConnection }.getOrNull() ?: return Hop(failed = true)
+        conns.add(c)
+        return readHop(c, base)
+    }
+
+    private suspend fun hopViaDoh(url: String, conns: ConcurrentLinkedQueue<HttpURLConnection>): Hop {
+        val base = runCatching { URL(url) }.getOrNull() ?: return Hop()
+        val host = base.host
+        if (!base.protocol.equals("https", true) || host.isNullOrEmpty() || ProxyParser.isIpLiteral(host)) return Hop()
+        val ip = Net.resolveHost(host) ?: return Hop()
+        val c = runCatching {
+            (URL("https", ip, base.port, base.file).openConnection() as HttpsURLConnection).apply {
+                sslSocketFactory = SniSocketFactory(HttpsURLConnection.getDefaultSSLSocketFactory(), host)
+                hostnameVerifier = HostnameVerifier { _, session ->
+                    HttpsURLConnection.getDefaultHostnameVerifier().verify(host, session)
+                }
+                setRequestProperty("Host", if (base.port == -1 || base.port == 443) host else "$host:${base.port}")
+            }
+        }.getOrNull() ?: return Hop()
+        conns.add(c)
+        return readHop(c, base)
+    }
+
+    /** Reads one response. [base] is the URL the caller asked for (redirects are resolved against it, not the IP). */
+    private fun readHop(c: HttpURLConnection, base: URL): Hop = try {
+        c.connectTimeout = ATTEMPT_TIMEOUT_MS
+        c.readTimeout = ATTEMPT_TIMEOUT_MS
+        c.instanceFollowRedirects = false
+        c.setRequestProperty("User-Agent", "SilentGateVPN/1.2")
+        val code = c.responseCode
+        when {
+            code in 300..399 -> {
+                val target = c.getHeaderField("Location")?.let { runCatching { URL(base, it) }.getOrNull() }
+                if (target != null && target.protocol.equals("https", true)) Hop(redirect = target.toString())
+                else Hop(failed = true)   // redirect to http:// or nowhere: an ISP block redirect
+            }
+            code !in 200..299 -> Hop(failed = code == 403 || code == 451 || code >= 500)
+            else -> {
+                val buf = java.io.ByteArrayOutputStream()
+                val limit = MAX_BODY_BYTES
+                c.inputStream.use { ins ->
+                    val chunk = ByteArray(16 * 1024)
+                    while (true) {
+                        val n = ins.read(chunk)
+                        if (n < 0) break
+                        buf.write(chunk, 0, n)
+                        if (buf.size() > limit) break
+                    }
+                }
+                val body = buf.toString(Charsets.UTF_8.name())
+                // A CDN error page or a captive-portal / ISP block page is not a feed.
+                if (body.length < 40 || body.trimStart().startsWith("<")) Hop(failed = true) else Hop(body = body)
+            }
+        }
+    } catch (_: Exception) {
+        Hop(failed = true)
+    } finally {
+        runCatching { c.disconnect() }
+    }
+
+    /** Connects by IP but presents the real host name in the TLS handshake (SNI), so CDN hosts answer correctly. */
+    private class SniSocketFactory(private val d: SSLSocketFactory, private val sni: String) : SSLSocketFactory() {
+        override fun getDefaultCipherSuites(): Array<String> = d.defaultCipherSuites
+        override fun getSupportedCipherSuites(): Array<String> = d.supportedCipherSuites
+        override fun createSocket(s: Socket, host: String?, port: Int, autoClose: Boolean): Socket =
+            d.createSocket(s, sni, port, autoClose)
+        override fun createSocket(host: String?, port: Int): Socket = d.createSocket(host, port)
+        override fun createSocket(host: String?, port: Int, localHost: InetAddress?, localPort: Int): Socket =
+            d.createSocket(host, port, localHost, localPort)
+        override fun createSocket(host: InetAddress?, port: Int): Socket = d.createSocket(host, port)
+        override fun createSocket(address: InetAddress?, port: Int, localAddress: InetAddress?, localPort: Int): Socket =
+            d.createSocket(address, port, localAddress, localPort)
     }
 
     /** Races the original URL against its mirrors; the first valid body wins and the losers are cancelled at once. */

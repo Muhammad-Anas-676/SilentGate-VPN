@@ -16,10 +16,12 @@ import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.Os
 import android.os.Process
 import androidx.core.app.NotificationCompat
 import com.silentgatevpn.app.MainActivity
 import com.silentgatevpn.app.R
+import com.silentgatevpn.app.SilentGateApp
 import io.nekohasekai.libbox.AutoRedirectHandler
 import io.nekohasekai.libbox.AutoRedirectSession
 import io.nekohasekai.libbox.BridgeOptions
@@ -108,7 +110,8 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
     @Volatile private var stopping = false
     /** Second descriptor for the TUN (dup of the one handed to libbox): lets us close the interface ourselves. */
     @Volatile private var tunGuard: ParcelFileDescriptor? = null
-    @Volatile private var tunName: String? = null
+    /** Makes "stop requested" and "TUN being created" mutually exclusive, so Disconnect can never race a new tun0. */
+    private val tunLock = Any()
     /** Set only when the core failed to release the TUN in time: the process is then ended so tun0 cannot linger. */
     @Volatile private var forceKill = false
 
@@ -139,7 +142,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         stopping = true
         // Normally everything is already closed (requestStop ran first). If Android destroys the service by itself,
         // close here, with short limits so the main thread is never blocked for long.
-        if (server != null || tunGuard != null || networkCallback != null) {
+        if (server != null || tunGuard != null || networkCallback != null || tunFds().isNotEmpty()) {
             runCatching { runBlocking(Dispatchers.IO) { teardown(Status.DISCONNECTED, cancelConnect = true, fast = true) } }
         }
         scope.coroutineContext[Job]?.cancel()
@@ -166,7 +169,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
     private suspend fun teardown(finalStatus: Status, cancelConnect: Boolean, fast: Boolean = false) {
         withContext(NonCancellable + Dispatchers.IO) {
             teardownMutex.withLock {
-                stopping = true
+                synchronized(tunLock) { stopping = true }
                 VpnState.status.value = Status.DISCONNECTING
                 monitorJob?.cancel(); monitorJob = null
                 if (cancelConnect) {
@@ -175,7 +178,6 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                     withTimeoutOrNull(if (fast) 300 else 1_500) { j?.join() }
                 }
                 val srv = server; server = null
-                val guard = tunGuard; tunGuard = null
                 var coreClosed = true
                 if (srv != null) {
                     coreClosed = runBounded("closeService", if (fast) 2_000 else 5_000) { srv.closeService() }
@@ -184,13 +186,10 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                 }
                 unregisterNetworkCallback()
                 runCatching { setUnderlyingNetworks(null) }
+                // Read after the core is closed: stopping is already set, so no new TUN can appear from here on.
+                val guard = synchronized(tunLock) { tunGuard.also { tunGuard = null } }
                 runCatching { guard?.close() }
-                val gone = waitTunGone(if (fast) 600 else 2_500)
-                if (!gone) {
-                    VpnState.log("tun0 is still present after closing")
-                    if (!coreClosed) forceKill = true
-                }
-                tunName = null
+                releaseTun(fast)
                 VpnState.resetSession()
                 VpnState.layer.value = null
                 if (finalStatus == Status.DISCONNECTED) VpnState.message.value = ""
@@ -211,23 +210,47 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         return !t.isAlive
     }
 
-    private fun tunNames(): Set<String> {
-        val sys = runCatching { File("/sys/class/net").list()?.filter { it.startsWith("tun") } }.getOrNull()
-        if (sys != null) return sys.toSet()
-        return runCatching {
-            JavaInterface.getNetworkInterfaces()?.toList()?.filter { it.name.startsWith("tun") }?.map { it.name }?.toSet()
-        }.getOrNull().orEmpty()
+    private fun isTunTarget(t: String): Boolean = t == "/dev/tun" || t == "/dev/net/tun" || t.startsWith("/dev/tun")
+
+    /**
+     * Descriptor numbers of this process that still point at the TUN device. Reading our own /proc/self/fd works on
+     * every Android version (unlike /sys/class/net, which SELinux hides on Android 10+), and unlike the interface list
+     * it still shows a TUN that the core holds open after its routes were removed.
+     */
+    private fun tunFds(): List<Int> {
+        val names = runCatching { File("/proc/self/fd").list() }.getOrNull() ?: return emptyList()
+        val out = ArrayList<Int>()
+        for (n in names) {
+            val fd = n.toIntOrNull() ?: continue
+            val target = runCatching { Os.readlink("/proc/self/fd/$fd") }.getOrNull() ?: continue
+            if (isTunTarget(target)) out += fd
+        }
+        return out
     }
 
     private suspend fun waitTunGone(maxMs: Long): Boolean {
         val end = System.currentTimeMillis() + maxMs
         while (true) {
-            val names = tunNames()
-            val mine = tunName
-            if (if (mine != null) mine !in names else names.isEmpty()) return true
+            if (tunFds().isEmpty()) return true
             if (System.currentTimeMillis() >= end) return false
-            delay(100)
+            delay(50)
         }
+    }
+
+    /**
+     * Makes sure no /dev/tun descriptor survives, whatever the core did. Android keeps the VPN (and the key icon in
+     * Settings) alive for as long as ANY descriptor of the interface is open, including one that a Go goroutine still
+     * holds after closeService() returned. Order: short grace for the core, then close the leftovers ourselves, and
+     * only when even that fails let onDestroy end the process.
+     */
+    private suspend fun releaseTun(fast: Boolean) {
+        if (waitTunGone(if (fast) 150 else 600)) return
+        val left = tunFds()
+        VpnState.log("Closing ${left.size} leftover TUN descriptor(s) held by the core")
+        for (fd in left) runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+        if (waitTunGone(if (fast) 400 else 1_500)) return
+        VpnState.log("The TUN is still open after closing it, the app will restart to release it")
+        forceKill = true
     }
 
     private fun unregisterNetworkCallback() {
@@ -593,7 +616,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
 
     /**
      * In-session watchdog. Every second it updates the speed counters and looks for a stall (requests leaving the
-     * phone while nothing comes back). Every 10 s (3 s right after a Wi-Fi <-> mobile switch) and immediately on a
+     * phone while nothing comes back). Every 10 s (15 s on low-end phones; 3 s right after a Wi-Fi <-> mobile switch) and immediately on a
      * stall it runs [Net.health]: 4 parallel small fetches across different CDN hosts. Fewer than 2 answers, or a
      * very slow median, counts as a failure; 3 failures in a row (2 after a network change or a stall) fail over to
      * the next node or layer automatically.
@@ -626,13 +649,14 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                 val stalled = stallSecs >= 6
                 // Right after a Wi-Fi <-> mobile switch, check every 3 s instead of every 10 s.
                 val recentChange = System.currentTimeMillis() - lastNetChange < 25_000
-                val due = tick % (if (recentChange) 3 else 10) == 0
+                val due = tick % (if (recentChange) 3 else Net.healthEverySecs) == 0
                 if (due || stalled) {
                     if (stalled) { VpnState.log("Stalled requests on ${layer.title}, checking the tunnel"); stallSecs = 0 }
                     val h = Net.health(if (stalled) 4000 else 5000)
                     // Plenty of data flowing means the link is busy, not broken: never fail over on a busy link.
                     val busy = dRx > 300_000
-                    val healthy = busy || (h.ok >= 2 && h.medianMs <= 4_500)
+                    // Low-end phones probe with only 2 hosts (1 must answer), so a median over 2 values is not meaningful there.
+                    val healthy = busy || (h.ok >= Net.healthMinOk && (SilentGateApp.isLowEndDevice || h.medianMs <= 4_500))
                     failures = if (healthy) 0 else failures + 1
                     if (failures >= (if (recentChange || stalled) 2 else 3) && canFailover) {
                         val bad = currentNodeId
@@ -734,6 +758,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
     }
 
     override fun openTun(options: TunOptions): Int {
+        if (stopping) throw CancellationException("Service stopping")
         if (VpnService.prepare(this) != null) throw IllegalStateException("VPN permission not granted")
         val b = Builder().setSession("SilentGate VPN").setMtu(options.getMTU())
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
@@ -775,15 +800,25 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             }
         }
 
-        val before = tunNames()
         val pfd = b.establish() ?: throw IllegalStateException("Could not establish the VPN interface")
+        // Disconnect may have been tapped while establish() was running: do not hand a live TUN to a dying core.
+        if (stopping) {
+            runCatching { pfd.close() }
+            throw CancellationException("Service stopping")
+        }
         // libbox takes over the raw descriptor, so keep a duplicate: teardown can then close the interface itself
         // even if the core is slow, and tun0 is released as soon as both descriptors are closed.
         val guard = runCatching { ParcelFileDescriptor.dup(pfd.fileDescriptor) }.getOrNull()
-        tunGuard?.let { runCatching { it.close() } }
-        tunGuard = guard
-        tunName = (tunNames() - before).firstOrNull() ?: tunName
-        return pfd.detachFd()
+        return synchronized(tunLock) {
+            if (stopping) {
+                runCatching { guard?.close() }
+                runCatching { pfd.close() }
+                throw CancellationException("Service stopping")
+            }
+            tunGuard?.let { runCatching { it.close() } }
+            tunGuard = guard
+            pfd.detachFd()
+        }
     }
 
     override fun findConnectionOwner(
@@ -802,7 +837,13 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         lastIfaceIndex = -1
         lastNetwork = null
         val cb = object : ConnectivityManager.NetworkCallback() {
-            private fun push(network: Network) {
+            private fun push(network: Network, force: Boolean = false) {
+                // registerNetworkCallback reports EVERY matching network (Wi-Fi and mobile data at once), not only the
+                // best one like registerBestMatchingNetworkCallback (API 31+): only follow the preferred one.
+                if (!force && Build.VERSION.SDK_INT < 31) {
+                    val best = bestPhysical(cm)
+                    if (best != null && best != network) return
+                }
                 val caps = cm.getNetworkCapabilities(network)
                 if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
                 val name = cm.getLinkProperties(network)?.interfaceName ?: return
@@ -826,7 +867,9 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                 lastIfaceName = ""
                 lastIfaceIndex = -1
                 lastNetwork = null
-                listener.updateDefaultInterface("", -1, false, false)
+                val fallback = if (Build.VERSION.SDK_INT < 31) bestPhysical(cm, except = network) else null
+                if (fallback != null) push(fallback, force = true)
+                else listener.updateDefaultInterface("", -1, false, false)
             }
         }
         unregisterNetworkCallback()
@@ -834,9 +877,31 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         if (Build.VERSION.SDK_INT >= 31) {
             cm.registerBestMatchingNetworkCallback(request, cb, android.os.Handler(mainLooper))
         } else {
-            cm.requestNetwork(request, cb)
+            // Passive monitoring only. requestNetwork() would ask the system to bring up / switch networks (and needs
+            // CHANGE_NETWORK_STATE), which misbehaves on Android 7.0 to 11 budget builds.
+            if (Build.VERSION.SDK_INT >= 26) cm.registerNetworkCallback(request, cb, android.os.Handler(mainLooper))
+            else cm.registerNetworkCallback(request, cb)
         }
     }
+
+    /** 2 = Wi-Fi / Ethernet, 1 = mobile, 0 = other, -1 = not a usable physical network. */
+    private fun physicalRank(cm: ConnectivityManager, n: Network): Int {
+        val caps = cm.getNetworkCapabilities(n) ?: return -1
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return -1
+        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return -1
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> 2
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 1
+            else -> 0
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun bestPhysical(cm: ConnectivityManager, except: Network? = null): Network? =
+        runCatching {
+            cm.allNetworks.filter { it != except }.map { it to physicalRank(cm, it) }
+                .filter { it.second >= 0 }.maxByOrNull { it.second }?.first
+        }.getOrNull()
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
         unregisterNetworkCallback()
