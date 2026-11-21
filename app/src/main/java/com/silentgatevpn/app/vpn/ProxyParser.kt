@@ -100,6 +100,12 @@ object B64 {
 
 object ProxyParser {
 
+    /**
+     * Shadowsocks UDP relay is NOT assumed: most free public Shadowsocks nodes disable it, and Chrome's HTTP/3 (QUIC)
+     * then hangs instead of falling back to TCP. With false, the QUIC policy rejects UDP/443 for these nodes.
+     */
+    private const val SS_UDP_RELAY = false
+
     private val LINK_SCHEMES = setOf("vless", "vmess", "trojan", "hysteria2", "hy2", "tuic", "ss", "wg", "wireguard")
 
     fun isLinkScheme(s: String): Boolean = LINK_SCHEMES.contains(s.lowercase())
@@ -373,7 +379,7 @@ object ProxyParser {
             o.put("plugin", pn).put("plugin_opts", plugin.substringAfter(';', ""))
         }
         return ParsedProxy(
-            name.ifEmpty { host }, "shadowsocks", host, port, "tcp", "none", true, false, false, o,
+            name.ifEmpty { host }, "shadowsocks", host, port, "tcp", "none", SS_UDP_RELAY, false, false, o,
             "ss|$host|$port|$method|$password|$plugin"
         )
     }
@@ -470,7 +476,7 @@ object ProxyParser {
         }
         val transport = src.optJSONObject("transport")?.optString("type")?.ifEmpty { null } ?: if (type in setOf("hysteria2", "tuic", "wireguard", "awg", "warp")) "udp" else "tcp"
         val protocol = when (type) { "shadowsocks" -> "shadowsocks"; "awg" -> "wireguard"; else -> type }
-        val udp = type in setOf("hysteria2", "hysteria", "tuic", "wireguard", "awg", "warp", "shadowsocks")
+        val udp = type in setOf("hysteria2", "hysteria", "tuic", "wireguard", "awg", "warp") || (type == "shadowsocks" && SS_UDP_RELAY)
         return ParsedProxy(
             name, protocol, server, port, transport, security, udp, tls?.optBoolean("insecure", false) == true, isEndpoint, base,
             "json|" + base.toString().hashCode()
@@ -514,7 +520,7 @@ object ProxyParser {
                 if (plugin == "obfs" || plugin == "simple-obfs") {
                     o.put("plugin", "obfs-local").put("plugin_opts", "obfs=${g("plugin-opts.mode")};obfs-host=${g("plugin-opts.host")}")
                 }
-                ParsedProxy(name, "shadowsocks", host, port, "tcp", "none", true, false, false, o, "ss|$host|$port|${g("cipher")}|${g("password")}|$plugin")
+                ParsedProxy(name, "shadowsocks", host, port, "tcp", "none", SS_UDP_RELAY, false, false, o, "ss|$host|$port|${g("cipher")}|${g("password")}|$plugin")
             }
             "hysteria2", "hy2" -> buildHysteria2(name, g("password"), host, port, g("sni", "servername"),
                 g("skip-cert-verify").equals("true", true), g("obfs"), g("obfs-password"), g("alpn"))

@@ -83,9 +83,9 @@ fun AppsScreen() {
     val short = mapOf(SplitMode.OFF to "Off", SplitMode.EXCLUDE to "Bypass", SplitMode.ONLY to "Only")
 
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 20.dp)) {
-        Text("Split tunnelling", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 16.dp))
+        Text("Apps", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 16.dp))
         Text(
-            "Bypass: selected apps skip the VPN (good for banking and local apps). Only: just the selected apps use the VPN.",
+            "Split tunnelling. Bypass: selected apps skip the VPN (good for banking and local apps). Only: just the selected apps use the VPN.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
         )
@@ -120,7 +120,7 @@ fun AppsScreen() {
             OutlinedButton(onClick = {
                 val picks = apps.filter { a -> LOCAL_KEYWORDS.any { a.label.contains(it, true) } }.map { it.pkg }.toSet()
                 SettingsStore.update { it.copy(splitPackages = it.splitPackages + picks, splitMode = if (it.splitMode == SplitMode.OFF) SplitMode.EXCLUDE else it.splitMode) }
-            }) { Text("Pick banking & local") }
+            }) { Text("Bypass banking apps") }
             OutlinedButton(onClick = { SettingsStore.update { it.copy(splitPackages = emptySet()) } }) { Text("Clear (${settings.splitPackages.size})") }
         }
         LazyColumn(Modifier.weight(1f)) {

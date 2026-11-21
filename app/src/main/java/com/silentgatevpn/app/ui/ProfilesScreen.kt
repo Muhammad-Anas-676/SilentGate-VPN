@@ -53,7 +53,7 @@ import com.silentgatevpn.app.vpn.ProfileStore
 import com.silentgatevpn.app.vpn.SettingsStore
 
 @Composable
-fun ProfilesScreen() {
+fun ProfilesScreen(onBack: () -> Unit) {
     val profiles by ProfileStore.flow.collectAsState()
     val settings by SettingsStore.flow.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
@@ -68,11 +68,9 @@ fun ProfilesScreen() {
     var showLinks by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
-        Text("Profiles", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 16.dp))
-        Text(
-            "Smart Auto needs no setup: it uses community nodes in safe countries. Add your own server for a trusted exit, or extra subscriptions for more nodes.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp)
+        ScreenHeader(
+            "Custom profiles", onBack,
+            "Smart Auto needs no setup: it uses community nodes in safe countries. Add your own server for a trusted exit, or extra subscriptions for more nodes."
         )
 
         SectionTitle("Community nodes")
@@ -122,7 +120,7 @@ fun ProfilesScreen() {
         SgCardBox {
             Text("Cloudflare WARP", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Automatic free account, endpoint scanner and noise handled by the core. Tunnel type is chosen in Settings.",
+                "Automatic free account, endpoint scanner and noise handled by the core. Tunnel type is chosen in Settings > Advanced.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp)
             )

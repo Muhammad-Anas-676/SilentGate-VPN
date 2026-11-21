@@ -127,6 +127,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
     // ---------------------------------------------------------------- connect flow
 
     private enum class Stage(val layer: ConfigBuilder.Layer) {
+        PRIMARY(ConfigBuilder.Layer.PRIMARY),
         MY_SERVER(ConfigBuilder.Layer.MY_SERVER),
         NODES(ConfigBuilder.Layer.NODE),
         WARP(ConfigBuilder.Layer.WARP),
@@ -144,11 +145,13 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
     )
 
     /**
-     * Smart Auto never ends in an unmasked connection: own server, then community nodes, then WARP.
-     * "DPI only" exists, but only when the user picks it explicitly.
+     * Smart Auto never ends in an unmasked connection: private primary server, own profile, vetted community nodes,
+     * and WARP only as a clearly labelled last resort. "DPI only" exists, but only when the user picks it explicitly.
      */
     private fun stagesFor(s: AppSettings): List<Stage> = when (s.mode) {
         ConnectMode.AUTO -> buildList {
+            // A country picked on Home means "exit there", which a fixed private server cannot honour.
+            if (s.primaryFirst && s.preferredCountry == "AUTO" && PrimaryServer.isConfigured()) add(Stage.PRIMARY)
             if (ProfileStore.active() != null) add(Stage.MY_SERVER)
             if (s.communityNodes) add(Stage.NODES)
             add(Stage.WARP)
@@ -205,6 +208,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             if (skipLayer != null) stages = stages.filter { it.layer != skipLayer } + stages.filter { it.layer == skipLayer }
             for (stage in stages) {
                 val ok = when (stage) {
+                    Stage.PRIMARY -> tryPrimary(run)
                     Stage.MY_SERVER -> tryOwnServer(run)
                     Stage.NODES -> tryNodes(run, ConfigBuilder.Layer.NODE)
                     Stage.WARP_NODE -> tryNodes(run, ConfigBuilder.Layer.WARP_NODE)
@@ -214,12 +218,24 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                 if (ok) return
             }
             VpnState.lastFailure.value = run.reasons
-            fail("Could not make a safe connection. See details below.")
+            run.reasons.forEach { VpnState.log("- $it") }
+            fail("Could not make a safe connection. Check your internet and try again.")
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             fail(e.message ?: "Unknown error")
         }
+    }
+
+    /** Private primary server slot: tried before everything else; silently skipped when none is configured. */
+    private suspend fun tryPrimary(run: Run): Boolean {
+        val list = PrimaryServer.proxies()
+        if (list.isEmpty()) return false
+        for ((i, p) in list.withIndex()) {
+            val label = "Private server" + if (list.size > 1) " ${i + 1}" else ""
+            if (attempt(run, ConfigBuilder.Layer.PRIMARY, p, null, label, enforce = true, rotateDns = true)) return true
+        }
+        return false
     }
 
     private suspend fun tryOwnServer(run: Run): Boolean {
@@ -245,30 +261,44 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             return false
         }
         val t0 = System.currentTimeMillis()
-        val budget = 42_000L
+        val budget = 50_000L
         val now = System.currentTimeMillis()
 
         // Fast path: nodes that worked recently are tried first, without any pre-flight, so reconnects are quick.
-        val fast = cands.filter { it.lastOkAt > 0 && now - it.lastOkAt < NodePool.STALE_MS }.take(2)
+        // (They were verified with the parallel media test the last time, and the verify step runs again anyway.)
+        val fast = cands.filter { it.lastOkAt > 0 && now - it.lastOkAt < NodePool.STALE_MS && it.mediaMs <= 2_500 }.take(2)
         for (n in fast) {
             if (attemptNode(run, layer, n)) return true
             if (System.currentTimeMillis() - t0 > budget) return false
         }
 
-        // Others: pre-flight in parallel (6 at a time, gentle on a low-RAM phone) and connect in order of arrival.
+        // Others: pre-flight in parallel and connect in order of arrival. Budget-phone caps: at most 6 nodes probed at
+        // once (nodeSem) and at most 6 sockets open at once across all of them (gate), whatever the burst size.
         val rest = cands.filter { c -> fast.none { it.id == c.id } }.take(14)
         val ch = Channel<Pair<Node, Long>>(Channel.UNLIMITED)
-        val sem = Semaphore(6)
-        val jobs = rest.map { n -> Net.launchIo { sem.withPermit { ch.send(n to Prober.preflight(n)) } } }
+        val nodeSem = Semaphore(6)
+        val gate = Semaphore(6)
+        val jobs = rest.map { n -> Net.launchIo { nodeSem.withPermit { ch.send(n to Prober.preflight(n, gate = gate)) } } }
         var pending = jobs.size
         var tried = 0
         var ok = false
+        val slow = ArrayList<Node>()
         try {
             while (pending > 0 && tried < 6 && !ok && System.currentTimeMillis() - t0 < budget) {
-                val got = withTimeoutOrNull(6_000) { ch.receive() } ?: break
+                val got = withTimeoutOrNull(9_000) { ch.receive() } ?: break
                 pending--
                 val (n, ms) = got
-                if (ms < 0) { NodePool.markFail(n.id); failedNodes.add(n.id); continue }
+                if (ms < 0) {
+                    // Unreachable, or it resets / drops parallel connections (Prober.THROTTLED): never pick it.
+                    if (ms == Prober.THROTTLED) VpnState.log("${n.name.take(24)}: drops parallel connections, skipped")
+                    NodePool.markFail(n.id); failedNodes.add(n.id); continue
+                }
+                if (ms > Prober.SLOW_MS) {
+                    // Overloaded: rank it down and keep it only as a last choice.
+                    NodePool.markLatency(n.id, ms)
+                    slow += n
+                    continue
+                }
                 tried++
                 ok = attemptNode(run, layer, n)
             }
@@ -276,7 +306,15 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             jobs.forEach { it.cancel() }
             ch.close()
         }
-        if (!ok && tried == 0) run.reasons += "Nodes: none of the ${rest.size} tested nodes is reachable on this network"
+        if (!ok && tried < 2 && slow.isNotEmpty()) {
+            VpnState.log("Only slow nodes answered, trying the least slow ones")
+            for (n in slow.sortedBy { it.latencyMs }.take(2)) {
+                if (System.currentTimeMillis() - t0 > budget) break
+                ok = attemptNode(run, layer, n)
+                if (ok) break
+            }
+        }
+        if (!ok && tried == 0 && slow.isEmpty()) run.reasons += "Nodes: none of the ${rest.size} tested nodes is reachable on this network"
         return ok
     }
 
@@ -353,9 +391,10 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         if (!v.ok) {
             VpnState.log("$label rejected: ${v.reason}")
             run.reasons += "$label: ${v.reason}"
+            if (node != null) NodePool.markMedia(node.id, v.mediaMs)   // overloaded nodes sink in the ranking
             return false
         }
-        if (node != null) NodePool.markOk(node.id, v.cc, v.rc, v.rttMs)
+        if (node != null) NodePool.markOk(node.id, v.cc, v.rc, v.rttMs, v.mediaMs)
         onConnected(layer, node, v)
         return true
     }
@@ -368,13 +407,17 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             else -> Protection.FULL
         }
         VpnState.protection.value = protection
+        // WARP in Smart Auto is only reached after every remote option failed: say so instead of claiming unblocking.
+        VpnState.backup.value = layer == ConfigBuilder.Layer.WARP && SettingsStore.value.mode == ConnectMode.AUTO
         VpnState.node.value = node?.name ?: ""
         VpnState.nodeCc.value = v.cc
         currentNodeId = node?.id
         VpnState.status.value = Status.CONNECTED
         VpnState.message.value = when (protection) {
             Protection.FULL -> "Protected via ${layer.title}"
-            Protection.GEO_LOCAL -> "IP hidden, but the exit looks like ${Geo.name(v.cc)}. Try Smart Auto or WARP + Node."
+            Protection.GEO_LOCAL ->
+                if (VpnState.backup.value) "Backup route: IP hidden, but the exit is near ${Geo.name(v.cc)}, so sites may still show local content or age checks."
+                else "IP hidden, but the exit looks like ${Geo.name(v.cc)}."
             Protection.DPI_ONLY -> "DPI bypass only. Your IP and country are NOT hidden."
             Protection.NONE -> "Not protected: your IP did not change"
         }
@@ -406,6 +449,13 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         fun tx(): Long = if (useTun) read(tunName!!, "tx_bytes") else TrafficStats.getUidTxBytes(uid).let { if (it < 0) TrafficStats.getTotalTxBytes() else it }
     }
 
+    /**
+     * In-session watchdog. Every second it updates the speed counters and looks for a stall (requests leaving the
+     * phone while nothing comes back). Every 10 s (3 s right after a Wi-Fi <-> mobile switch) and immediately on a
+     * stall it runs [Net.health]: 4 parallel small fetches across different CDN hosts. Fewer than 2 answers, or a
+     * very slow median, counts as a failure; 3 failures in a row (2 after a network change or a stall) fail over to
+     * the next node or layer automatically.
+     */
     private fun startMonitor(layer: ConfigBuilder.Layer) {
         monitorJob?.cancel()
         monitorJob = scope.launch {
@@ -414,26 +464,37 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             var lastRx = rx0; var lastTx = tx0
             var tick = 0
             var failures = 0
+            var stallSecs = 0
             val canFailover = SettingsStore.value.mode.let {
                 it == ConnectMode.AUTO || it == ConnectMode.NODES || it == ConnectMode.WARP_NODE
             }
             while (true) {
                 delay(1000)
                 val r = counters.rx(); val t = counters.tx()
-                VpnState.rxSpeed.value = (r - lastRx).coerceAtLeast(0)
-                VpnState.txSpeed.value = (t - lastTx).coerceAtLeast(0)
+                val dRx = (r - lastRx).coerceAtLeast(0)
+                val dTx = (t - lastTx).coerceAtLeast(0)
+                VpnState.rxSpeed.value = dRx
+                VpnState.txSpeed.value = dTx
                 VpnState.sessionRx.value = (r - rx0).coerceAtLeast(0)
                 VpnState.sessionTx.value = (t - tx0).coerceAtLeast(0)
                 lastRx = r; lastTx = t
                 tick++
+                // Stall: the phone keeps sending (page and image requests) but almost nothing comes back.
+                stallSecs = if (dTx >= 1_500 && dRx < 300) stallSecs + 1 else 0
+                val stalled = stallSecs >= 6
                 // Right after a Wi-Fi <-> mobile switch, check every 3 s instead of every 10 s.
                 val recentChange = System.currentTimeMillis() - lastNetChange < 25_000
-                if (tick % (if (recentChange) 3 else 10) == 0) {
-                    val ok = Net.probe(5000)
-                    failures = if (ok) 0 else failures + 1
-                    if (failures >= (if (recentChange) 2 else 3) && canFailover) {
+                val due = tick % (if (recentChange) 3 else 10) == 0
+                if (due || stalled) {
+                    if (stalled) { VpnState.log("Stalled requests on ${layer.title}, checking the tunnel"); stallSecs = 0 }
+                    val h = Net.health(if (stalled) 4000 else 5000)
+                    // Plenty of data flowing means the link is busy, not broken: never fail over on a busy link.
+                    val busy = dRx > 300_000
+                    val healthy = busy || (h.ok >= 2 && h.medianMs <= 4_500)
+                    failures = if (healthy) 0 else failures + 1
+                    if (failures >= (if (recentChange || stalled) 2 else 3) && canFailover) {
                         val bad = currentNodeId
-                        VpnState.log("Tunnel stalled on ${layer.title}; failing over")
+                        VpnState.log("Tunnel degraded on ${layer.title} (${h.ok}/${h.total} hosts, ${h.medianMs} ms); failing over")
                         if (bad != null) NodePool.markFail(bad)
                         connectJob = scope.launch { connectFlow(avoidNodeId = bad, skipLayer = if (bad == null) layer else null) }
                         return@launch

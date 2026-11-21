@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Optional built-in primary server (one or more share links separated by spaces). Never hardcode it in source:
+// pass -PsgPrimaryServer="vless://..." or set the SG_PRIMARY_SERVER env var / GitHub secret. Empty = none.
+val sgPrimaryServer: String = ((project.findProperty("sgPrimaryServer") as String?) ?: System.getenv("SG_PRIMARY_SERVER") ?: "")
+    .replace("\r", " ").replace("\n", " ").trim()
+
 android {
     namespace = "com.silentgatevpn.app"
     compileSdk = 35
@@ -12,8 +17,9 @@ android {
         applicationId = "com.silentgatevpn.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.1.0"
+        versionCode = 7
+        versionName = "1.2.0"
+        buildConfigField("String", "PRIMARY_SERVER", "\"" + sgPrimaryServer.replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 

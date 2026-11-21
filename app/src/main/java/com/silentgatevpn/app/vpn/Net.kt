@@ -37,8 +37,16 @@ data class Verify(
     val rc: String = "",
     val rttMs: Long = -1,
     val ipChanged: Boolean = true,
-    val geoLocal: Boolean = false
+    val geoLocal: Boolean = false,
+    /** Median time of the parallel media fetches in ms, or -1 when the media test did not run. */
+    val mediaMs: Long = -1
 )
+
+/** Outcome of N simultaneous small fetches across different CDN hosts. */
+data class MediaResult(val ok: Int, val total: Int, val medianMs: Long, val p90Ms: Long)
+
+/** Outcome of the content-filter / WAF check. [ok] = false means this exit blocks mainstream uncensored sites. */
+data class ContentResult(val ok: Boolean, val detail: String)
 
 object Net {
 
@@ -67,25 +75,39 @@ object Net {
         }
     }
 
-    /** Fetches the first KB of a URL, which is enough to prove a CDN delivers assets through the tunnel. */
-    private suspend fun fetchOk(url: String, timeoutMs: Int): Boolean = withContext(Dispatchers.IO) {
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+
+    /**
+     * Fetches up to [maxBytes] of a URL and returns how long it took in ms, or -1 on any failure (non-2xx, reset,
+     * timeout). Reading real bytes (not just the status line) is what exposes a node that throttles or drops data.
+     */
+    private suspend fun timedFetch(url: String, timeoutMs: Int, maxBytes: Int): Long = withContext(Dispatchers.IO) {
+        val t0 = System.currentTimeMillis()
         runCatching {
             val c = URL(url).openConnection() as HttpURLConnection
             try {
                 c.connectTimeout = timeoutMs
                 c.readTimeout = timeoutMs
-                c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 9) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
-                c.setRequestProperty("Range", "bytes=0-1023")
+                c.setRequestProperty("User-Agent", BROWSER_UA)
+                c.setRequestProperty("Range", "bytes=0-${maxBytes - 1}")
                 val code = c.responseCode
                 if (code in 200..299) {
-                    val buf = ByteArray(1024)
-                    runCatching { c.inputStream.use { it.read(buf) } }
-                    true
-                } else false
+                    val buf = ByteArray(4096)
+                    var total = 0
+                    c.inputStream.use { ins ->
+                        while (total < maxBytes) {
+                            val n = ins.read(buf)
+                            if (n < 0) break
+                            total += n
+                        }
+                    }
+                    System.currentTimeMillis() - t0
+                } else -1L
             } finally {
                 c.disconnect()
             }
-        }.getOrDefault(false)
+        }.getOrDefault(-1L)
     }
 
     suspend fun cfTrace(timeoutMs: Int = 8000): Trace {
@@ -251,13 +273,29 @@ object Net {
         "https://1.1.1.1/cdn-cgi/trace",
         "https://8.8.8.8/resolve?name=example.com&type=A"
     )
-    // Image/script CDNs, so "connected" means thumbnails and assets load, not just generate_204.
-    private val CDN_PROBES = listOf(
+    // Eight different CDN / asset hosts (two paths on one host, so same-host concurrency is exercised too). Fetched
+    // all at once: a node that throttles, resets or drops parallel connections fails here, which is exactly what
+    // makes only 1 of 10 thumbnails load on media sites.
+    private val MEDIA_PROBES = listOf(
         "https://www.gstatic.com/generate_204",
         "https://www.google.com/favicon.ico",
         "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js",
-        "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+        "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js",
+        "https://unpkg.com/jquery@3.7.1/dist/jquery.min.js",
+        "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js",
+        "https://www.cloudflare.com/favicon.ico",
+        "https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
     )
+
+    // Thresholds of the concurrent media test (tuned for budget phones on mobile data).
+    private const val MEDIA_MIN_OK = 6               // of 8 parallel fetches
+    private const val MEDIA_MAX_MEDIAN_MS = 3_500L   // slower than this = overloaded node
+    private const val EXIT_MAX_RTT_MS = 3_500L       // trace round trip through the node
+
+    // Mainstream uncensored endpoints that family-filter DNS, cloud WAFs and ISP blocklists commonly hit. Only
+    // /robots.txt is requested (a few hundred bytes of text); a node is rejected only when ALL of them are blocked
+    // or when DNS for any of them is poisoned.
+    private val CONTENT_HOSTS = listOf("www.pornhub.com", "xhamster.com")
 
     private suspend fun anyOk(urls: List<String>, timeoutMs: Int): Boolean = coroutineScope {
         urls.map { u -> async(Dispatchers.IO) { runCatching { http(u, timeoutMs) }.isSuccess } }.awaitAll().any { it }
@@ -282,31 +320,118 @@ object Net {
     }
 
     /**
-     * Pre-flight for "Protected": the exit IP must differ from the ISP IP, the exit region must be allowed, and at
-     * least two independent CDNs must deliver real assets. [enforce] = false only records the result.
+     * Runs [urls] simultaneously (default: the 8 media probes) and reports how many delivered real bytes and how fast.
+     * Failures count as the full timeout so the percentile reflects a stalled node honestly.
      */
-    suspend fun verifyExit(home: HomeInfo, s: AppSettings, expectMasked: Boolean, enforce: Boolean, wantCc: String): Verify = coroutineScope {
-        val traceJob = async(Dispatchers.IO) { runCatching { cfTrace(4500) }.getOrNull() ?: runCatching { cfTrace(4500) }.getOrNull() }
-        val cdnJob = async(Dispatchers.IO) {
-            CDN_PROBES.map { u -> async(Dispatchers.IO) { fetchOk(u, 5000) } }.awaitAll().count { it }
+    suspend fun mediaBurst(
+        urls: List<String> = MEDIA_PROBES, timeoutMs: Int = 6000, maxBytes: Int = 16 * 1024
+    ): MediaResult = coroutineScope {
+        val times = urls.map { u -> async(Dispatchers.IO) { timedFetch(u, timeoutMs, maxBytes) } }.awaitAll()
+        val okTimes = times.filter { it >= 0 }
+        val all = times.map { if (it >= 0) it else timeoutMs.toLong() }.sorted()
+        MediaResult(
+            ok = okTimes.size, total = times.size,
+            medianMs = if (all.isEmpty()) -1 else all[all.size / 2],
+            p90Ms = if (all.isEmpty()) -1 else all[((all.size - 1) * 9) / 10]
+        )
+    }
+
+    /** Small, cheap version for the in-session watchdog: 4 parallel fetches of 2 KB each. */
+    suspend fun health(timeoutMs: Int = 5000): MediaResult =
+        mediaBurst(MEDIA_PROBES.shuffled().take(4), timeoutMs, 2048)
+
+    private fun looksPoisoned(a: InetAddress): Boolean =
+        a.isAnyLocalAddress || a.isLoopbackAddress || a.isSiteLocalAddress || a.isLinkLocalAddress
+
+    /** 1 = reachable, 0 = soft (challenge / rate limit / site error: a real browser can still pass), -1 = blocked, -2 = DNS poisoned. */
+    private suspend fun contentProbe(host: String, timeoutMs: Int): Pair<Int, String> = withContext(Dispatchers.IO) {
+        val addrs = try {
+            InetAddress.getAllByName(host).toList()
+        } catch (e: Exception) {
+            return@withContext -1 to "$host: DNS failed"
         }
-        val t = traceJob.await() ?: return@coroutineScope Verify(false, "the exit did not answer the location check")
-        val changed = home.ip.isEmpty() || t.ip != home.ip
-        if (expectMasked && !changed) return@coroutineScope Verify(false, "your IP did not change, traffic is not going through the tunnel", t.ip, t.loc, "", t.rttMs, false)
-        val cc = t.loc
-        var rc = ""
-        if (cc.equals("US", true)) {
-            rc = runCatching { JSONObject(http("https://ipwho.is/", 4500)).optString("region_code") }.getOrDefault("")
+        if (addrs.any { looksPoisoned(it) }) return@withContext -2 to "$host: DNS poisoned (${addrs.first().hostAddress})"
+        val c = try { URL("https://$host/robots.txt").openConnection() as HttpURLConnection } catch (e: Exception) { return@withContext -1 to "$host: bad url" }
+        try {
+            c.instanceFollowRedirects = false
+            c.connectTimeout = timeoutMs
+            c.readTimeout = timeoutMs
+            c.setRequestProperty("User-Agent", BROWSER_UA)
+            c.setRequestProperty("Accept", "*/*")
+            val code = c.responseCode
+            val mitigated = c.getHeaderField("cf-mitigated").orEmpty()
+            runCatching { (if (code >= 400) c.errorStream else c.inputStream)?.use { it.read(ByteArray(512)) } }
+            when {
+                code in 200..399 -> 1 to "$host: HTTP $code"
+                code == 451 -> -1 to "$host: HTTP 451 (blocked)"
+                code == 403 && mitigated.equals("challenge", true) -> 0 to "$host: challenge page"
+                code == 403 -> -1 to "$host: HTTP 403 (IP blocked by the site)"
+                code == 429 || code >= 500 -> 0 to "$host: HTTP $code"
+                else -> 0 to "$host: HTTP $code"
+            }
+        } catch (e: Exception) {
+            -1 to "$host: ${e.javaClass.simpleName} (connection reset or timed out)"
+        } finally {
+            c.disconnect()
         }
-        val reason = Geo.excludedReason(cc, rc, home.cc, s.avoidRestricted, s.allowHomeExit)
-        val geoLocal = cc.isNotEmpty() && cc.equals(home.cc, true)
-        if (enforce && reason != null) return@coroutineScope Verify(false, reason, t.ip, cc, rc, t.rttMs, changed, geoLocal)
-        if (enforce && wantCc != "AUTO" && cc.isNotEmpty() && !cc.equals(wantCc, true)) {
-            return@coroutineScope Verify(false, "exit is ${Geo.name(cc)}, you asked for ${Geo.name(wantCc)}", t.ip, cc, rc, t.rttMs, changed, geoLocal)
+    }
+
+    /**
+     * Content-filter / WAF check through the tunnel: DNS must not be poisoned for any probe host, and at least one of
+     * them must answer (blocked = 403, 451, reset, timeout on every host means the exit IP or its resolver filters content).
+     */
+    suspend fun contentCheck(timeoutMs: Int = 6000): ContentResult = coroutineScope {
+        val r = CONTENT_HOSTS.map { h -> async(Dispatchers.IO) { contentProbe(h, timeoutMs) } }.awaitAll()
+        val poisoned = r.firstOrNull { it.first == -2 }
+        if (poisoned != null) return@coroutineScope ContentResult(false, "content filter: ${poisoned.second}")
+        if (r.none { it.first >= 0 }) {
+            return@coroutineScope ContentResult(false, "content filter: " + r.joinToString("; ") { it.second })
         }
-        val cdn = cdnJob.await()
-        if (enforce && cdn < 2) return@coroutineScope Verify(false, "image/CDN hosts do not load through this node ($cdn of ${CDN_PROBES.size})", t.ip, cc, rc, t.rttMs, changed, geoLocal)
-        Verify(true, "", t.ip, cc, rc, t.rttMs, changed, geoLocal)
+        ContentResult(true, "")
+    }
+
+    /**
+     * Gate for "Connected". The exit IP must differ from the ISP IP, the region must be allowed, and, when [enforce]
+     * is true, the exit must also survive three real-world tests: 6 of 8 parallel CDN fetches with a sane median time
+     * (no throttling of concurrent connections), a content-filter / WAF check, and a latency ceiling.
+     * [enforce] = false only records the result (used for WARP, which is Cloudflare itself).
+     */
+    suspend fun verifyExit(home: HomeInfo, s: AppSettings, expectMasked: Boolean, enforce: Boolean, wantCc: String): Verify {
+        val traceJob = ioScope.async { runCatching { cfTrace(4500) }.getOrNull() ?: runCatching { cfTrace(4500) }.getOrNull() }
+        // Started outside this coroutine's scope so an early rejection never waits for blocking sockets.
+        val mediaJob = ioScope.async { if (enforce) mediaBurst() else null }
+        val contentJob = ioScope.async { if (enforce) contentCheck() else null }
+        try {
+            val t = traceJob.await() ?: return Verify(false, "the exit did not answer the location check")
+            val changed = home.ip.isEmpty() || t.ip != home.ip
+            if (expectMasked && !changed) return Verify(false, "your IP did not change, traffic is not going through the tunnel", t.ip, t.loc, "", t.rttMs, false)
+            val cc = t.loc
+            var rc = ""
+            if (cc.equals("US", true)) {
+                rc = runCatching { JSONObject(http("https://ipwho.is/", 4500)).optString("region_code") }.getOrDefault("")
+            }
+            val reason = Geo.excludedReason(cc, rc, home.cc, s.avoidRestricted, s.allowHomeExit)
+            val geoLocal = cc.isNotEmpty() && cc.equals(home.cc, true)
+            fun v(ok: Boolean, why: String, ms: Long = -1) = Verify(ok, why, t.ip, cc, rc, t.rttMs, changed, geoLocal, ms)
+            if (enforce && reason != null) return v(false, reason)
+            if (enforce && wantCc != "AUTO" && cc.isNotEmpty() && !cc.equals(wantCc, true)) {
+                return v(false, "exit is ${Geo.name(cc)}, you asked for ${Geo.name(wantCc)}")
+            }
+            if (!enforce) return v(true, "")
+            if (t.rttMs > EXIT_MAX_RTT_MS) return v(false, "exit is too slow (${t.rttMs} ms to reach the location check)")
+            val m = mediaJob.await() ?: return v(false, "media test did not run")
+            if (m.ok < MEDIA_MIN_OK) {
+                return v(false, "parallel media test failed: only ${m.ok} of ${m.total} CDN hosts loaded (node drops concurrent connections)", m.medianMs)
+            }
+            if (m.medianMs > MEDIA_MAX_MEDIAN_MS) {
+                return v(false, "node is overloaded: median ${m.medianMs} ms for small CDN files", m.medianMs)
+            }
+            val c = contentJob.await() ?: ContentResult(true, "")
+            if (!c.ok) return v(false, c.detail, m.medianMs)
+            return v(true, "", m.medianMs)
+        } finally {
+            traceJob.cancel(); mediaJob.cancel(); contentJob.cancel()
+        }
     }
 
     suspend fun pingMedian(count: Int = 3): Long {

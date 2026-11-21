@@ -5,8 +5,8 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,28 +27,29 @@ import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Shield
-import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import com.silentgatevpn.app.vpn.ConnectMode
 import com.silentgatevpn.app.vpn.Geo
 import com.silentgatevpn.app.vpn.Net
@@ -59,27 +60,33 @@ import com.silentgatevpn.app.vpn.Status
 import com.silentgatevpn.app.vpn.VpnState
 import com.silentgatevpn.app.vpn.formatBytes
 
+/**
+ * SuperVPN-style Home: one power button, one location card, one speed card. No modes, no node names, no diagnostics.
+ * (Connection mode, nodes and tools live in Settings > Advanced.)
+ */
 @Composable
 fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
     val status by VpnState.status.collectAsState()
-    val layer by VpnState.layer.collectAsState()
-    val message by VpnState.message.collectAsState()
-    val exit by VpnState.exit.collectAsState()
+    val protection by VpnState.protection.collectAsState()
+    val backup by VpnState.backup.collectAsState()
+    val connectedCc by VpnState.nodeCc.collectAsState()
     val rx by VpnState.rxSpeed.collectAsState()
     val tx by VpnState.txSpeed.collectAsState()
     val sRx by VpnState.sessionRx.collectAsState()
     val sTx by VpnState.sessionTx.collectAsState()
     val settings by SettingsStore.flow.collectAsState()
-    val alwaysOn by VpnState.alwaysOn.collectAsState()
-    val lockdown by VpnState.lockdown.collectAsState()
-    val protection by VpnState.protection.collectAsState()
-    val nodeName by VpnState.node.collectAsState()
-    val pool by NodePool.nodes.collectAsState()
     val poolBusy by NodePool.refreshing.collectAsState()
     var showPicker by remember { mutableStateOf(false) }
 
     val connected = status == Status.CONNECTED
-    val busy = status == Status.CONNECTING || status == Status.DISCONNECTING
+    val idle = status == Status.DISCONNECTED || status == Status.ERROR
+    val warn = connected && (protection != Protection.FULL || backup)
+
+    // A saved country that is no longer offered (for example a restricted one from an older version) falls back to Auto.
+    LaunchedEffect(settings.preferredCountry) {
+        val pc = settings.preferredCountry
+        if (pc != "AUTO" && pc !in Geo.PICKER_COUNTRIES) SettingsStore.update { it.copy(preferredCountry = "AUTO") }
+    }
 
     Column(
         Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
@@ -91,206 +98,134 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
             Text("SilentGate VPN", style = MaterialTheme.typography.titleLarge)
         }
 
-        Spacer(Modifier.height(28.dp))
-        ConnectButton(status = status, warn = connected && protection != Protection.FULL, onClick = {
+        Spacer(Modifier.height(32.dp))
+        ConnectButton(status = status, warn = warn, onClick = {
             when (status) {
                 Status.DISCONNECTED, Status.ERROR -> onConnect()
                 Status.CONNECTED, Status.CONNECTING -> onDisconnect()
-                else -> Unit
+                Status.DISCONNECTING -> Unit
             }
         })
         Spacer(Modifier.height(20.dp))
 
-        val headline = when (status) {
-            Status.DISCONNECTED -> "Not protected"
-            Status.CONNECTING -> "Connecting…"
-            Status.CONNECTED -> when (protection) {
-                Protection.FULL -> "Protected"
-                Protection.GEO_LOCAL -> "IP hidden"
-                Protection.DPI_ONLY -> "DPI bypass only"
-                Protection.NONE -> "Not protected"
-            }
-            Status.DISCONNECTING -> "Disconnecting…"
-            Status.ERROR -> "Connection failed"
-        }
         Text(
-            headline, style = MaterialTheme.typography.headlineMedium,
-            color = when (status) {
-                Status.CONNECTED -> when (protection) {
-                    Protection.FULL -> SgGreen
-                    Protection.NONE -> SgDanger
-                    else -> SgOrange
-                }
-                Status.ERROR -> SgDanger
+            when (status) {
+                Status.DISCONNECTED -> "Not Connected"
+                Status.CONNECTING -> "Connecting…"
+                Status.CONNECTED -> "Connected"
+                Status.DISCONNECTING -> "Disconnecting…"
+                Status.ERROR -> "Couldn’t connect"
+            },
+            style = MaterialTheme.typography.headlineMedium,
+            color = when {
+                status == Status.ERROR -> SgDanger
+                connected && protection == Protection.NONE -> SgDanger
+                connected && warn -> SgOrange
+                connected -> SgGreen
                 else -> MaterialTheme.colorScheme.onSurface
             }
         )
-        val sub = when {
-            message.isNotEmpty() -> message
-            status == Status.DISCONNECTED -> "Tap the button to connect"
-            else -> ""
-        }
-        if (sub.isNotEmpty()) {
-            Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center, modifier = Modifier.padding(top = 4.dp))
-        }
+        Text(
+            when (status) {
+                Status.DISCONNECTED -> "Tap the button to connect"
+                Status.CONNECTING -> "Finding the fastest server…"
+                Status.CONNECTED -> "Your connection is private"
+                Status.DISCONNECTING -> ""
+                Status.ERROR -> "Check your internet and try again"
+            },
+            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp)
+        )
 
         if (status == Status.ERROR) {
-            val reasons by VpnState.lastFailure.collectAsState()
             val log by VpnState.log.collectAsState()
             val clipboard = LocalClipboardManager.current
-            Spacer(Modifier.height(14.dp))
-            SgCardBox(container = SgDangerBg, border = SgDanger) {
-                Text("Why it failed", style = MaterialTheme.typography.titleMedium, color = Color(0xFFFFB4AB))
-                (if (reasons.isEmpty()) log.takeLast(4) else reasons).forEach {
-                    Text("• $it", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB4AB), modifier = Modifier.padding(top = 4.dp))
-                }
-                OutlinedButton(
-                    onClick = { clipboard.setText(AnnotatedString(log.joinToString("\n"))) },
-                    modifier = Modifier.padding(top = 10.dp),
-                    border = BorderStroke(1.dp, SgDanger)
-                ) { Text("Copy full log", color = Color(0xFFFFB4AB)) }
+            TextButton(onClick = { clipboard.setText(AnnotatedString(log.takeLast(40).joinToString("\n"))) }) {
+                Text("Copy details", color = SgGreen)
             }
         }
 
-        Spacer(Modifier.height(20.dp))
-        ChoiceChips(
-            options = ConnectMode.entries, selected = settings.mode, label = { it.label },
-            enabled = status == Status.DISCONNECTED || status == Status.ERROR
-        ) { m -> SettingsStore.update { it.copy(mode = m) } }
-        Text(settings.mode.hint, style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
-
-        if (settings.mode == ConnectMode.DPI_ONLY) {
-            Spacer(Modifier.height(12.dp))
-            SgCardBox(container = SgWarnBg, border = SgOrange) {
-                Text("This mode does not hide your IP", style = MaterialTheme.typography.titleMedium, color = SgOrange)
+        // Honest one-line notices: only when something is not the normal, fully private case.
+        val notice: Pair<String, String>? = when {
+            connected && protection == Protection.NONE -> "Not protected" to "Your IP address did not change. Disconnect and try again."
+            connected && backup -> "Backup connection" to "No server was available, so a backup route is used. Your IP is hidden, but sites may still treat you as being in your own country."
+            connected && protection == Protection.DPI_ONLY -> "Unblock-only mode" to "Your IP address is not hidden in this mode. You can change it in Settings › Advanced."
+            connected && protection == Protection.GEO_LOCAL -> "Nearby location" to "Your IP is hidden, but this location is close to yours, so sites may show local content."
+            idle && settings.mode != ConnectMode.AUTO -> "Advanced mode on" to "${settings.mode.label} is selected in Settings › Advanced. Switch back to Smart Auto for the normal 1-tap experience."
+            else -> null
+        }
+        if (notice != null) {
+            Spacer(Modifier.height(16.dp))
+            val danger = connected && protection == Protection.NONE
+            SgCardBox(
+                container = if (danger) SgDangerBg else SgWarnBg,
+                border = if (danger) SgDanger else SgOrange
+            ) {
+                Text(notice.first, style = MaterialTheme.typography.titleMedium, color = if (danger) Color(0xFFFFB4AB) else SgOrange)
                 Text(
-                    "Websites will still see your real IP address and country. It only helps open filtered sites. Use Smart Auto for privacy.",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
-        } else {
-            Spacer(Modifier.height(12.dp))
-            val idle = status == Status.DISCONNECTED || status == Status.ERROR
-            SgCardBox(Modifier.clickable(enabled = idle) { showPicker = true }) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Location", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text(
-                            if (settings.preferredCountry == "AUTO") "\u26A1 Fastest Safe Location (Auto)"
-                            else "${Geo.flag(settings.preferredCountry)} ${Geo.name(settings.preferredCountry)}",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                    }
-                    Text(if (idle) "Change" else "", color = SgGreen, style = MaterialTheme.typography.labelLarge)
-                }
-                Text(
-                    (if (poolBusy) "Updating nodes…" else "${pool.size} nodes ready") +
-                        " · skips ${Geo.name(Net.home.cc)}" + if (settings.avoidRestricted) " and age-verification regions" else "",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    notice.second, style = MaterialTheme.typography.bodySmall,
+                    color = if (danger) Color(0xFFFFB4AB) else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp)
                 )
             }
         }
 
-        Spacer(Modifier.height(20.dp))
-        SgCardBox {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Stat(Icons.Rounded.ArrowDownward, "Download", "${formatBytes(rx)}/s", formatBytes(sRx))
-                Stat(Icons.Rounded.ArrowUpward, "Upload", "${formatBytes(tx)}/s", formatBytes(sTx))
+        Spacer(Modifier.height(24.dp))
+        SgCardBox(Modifier.clickable(enabled = idle, role = Role.Button, onClickLabel = "Choose location") { showPicker = true }) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Location", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        if (settings.preferredCountry == "AUTO") "⚡ Fastest Location (Auto)"
+                        else "${Geo.flag(settings.preferredCountry)} ${Geo.name(settings.preferredCountry)}",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+                if (idle) Text("Change", color = SgGreen, style = MaterialTheme.typography.labelLarge)
             }
-            if (connected && layer != null) {
-                Spacer(Modifier.height(12.dp))
-                Text("Active: ${layer!!.title}", style = MaterialTheme.typography.bodyMedium, color = SgGreenSoft)
+            val sub = when {
+                connected && connectedCc.isNotEmpty() -> "Connected: ${Geo.flag(connectedCc)} ${Geo.name(connectedCc)}"
+                poolBusy -> "Updating servers…"
+                else -> ""
+            }
+            if (sub.isNotEmpty()) {
+                Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
             }
         }
 
         if (connected) {
-            Spacer(Modifier.height(12.dp))
-            val e = exit
+            Spacer(Modifier.height(16.dp))
             SgCardBox {
-                Text("Exit", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(6.dp))
-                if (e == null) {
-                    Text("Checking exit location…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    InfoLine("IP", e.ip)
-                    InfoLine("Location", listOf(e.city, e.region, e.country).filter { it.isNotEmpty() }.joinToString(", "))
-                    if (nodeName.isNotEmpty()) InfoLine("Node", nodeName)
-                    if (e.colo.isNotEmpty()) InfoLine("Cloudflare edge", e.colo)
-                    if (e.pingMs >= 0) InfoLine("Latency", "${e.pingMs} ms")
-                    e.warpOn?.let { InfoLine("WARP", if (it) "On" else "Off (other layer)") }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Stat(Icons.Rounded.ArrowDownward, "Download", "${formatBytes(rx)}/s", formatBytes(sRx))
+                    Stat(Icons.Rounded.ArrowUpward, "Upload", "${formatBytes(tx)}/s", formatBytes(sTx))
                 }
             }
-            if (e != null && protection == Protection.GEO_LOCAL && !e.restricted) {
-                Spacer(Modifier.height(12.dp))
-                SgCardBox(container = SgWarnBg, border = SgOrange) {
-                    Text("Exit looks like your own country", style = MaterialTheme.typography.titleMedium, color = SgOrange)
-                    Text(
-                        "Your IP is hidden, but websites may still show local content because this exit (${Geo.name(e.countryCode)}) is near you. Smart Auto with community nodes picks a different country.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
-                }
-            }
-            if (e?.restricted == true) {
-                Spacer(Modifier.height(12.dp))
-                SgCardBox(container = SgDangerBg, border = SgDanger) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Rounded.Warning, contentDescription = null, tint = SgDanger)
-                        Spacer(Modifier.size(10.dp))
-                        Text("Exit is in a region with age-verification rules", style = MaterialTheme.typography.titleMedium, color = Color(0xFFFFB4AB))
-                    }
-                    Text(
-                        "Your exit location (${e.region.ifEmpty { e.country }}) is on the restricted list. Reconnect, or switch layer in Profiles/Settings.",
-                        style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB4AB), modifier = Modifier.padding(top = 6.dp)
-                    )
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            SgCardBox(container = if (alwaysOn && lockdown) SgCard else SgWarnBg, border = if (alwaysOn && lockdown) MaterialTheme.colorScheme.outlineVariant else SgOrange) {
-                Text("Kill switch", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    if (alwaysOn && lockdown) "Always-on VPN and Block connections without VPN are active."
-                    else "For a real kill switch, turn on Always-on VPN and Block connections without VPN in Android settings (Settings tab has a shortcut).",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-        SgCardBox {
-            Text("Tip", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "If a site already showed an age-verification banner on another connection, clear its cookies or use Incognito after connecting.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp)
-            )
         }
         MadeByAnas()
     }
 
     if (showPicker) {
-        val countries = NodePool.availableCountries(settings, Net.home)
+        val countries = NodePool.availableCountries(settings, Net.home).filterKeys { it in Geo.PICKER_COUNTRIES }
         AlertDialog(
             onDismissRequest = { showPicker = false },
             containerColor = Color(0xFF121212),
             title = { Text("Choose location") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
-                    PickerRow("\u26A1 Fastest Safe Location (Auto)", "Best verified node, never your home country", settings.preferredCountry == "AUTO") {
+                    PickerRow("⚡ Fastest Location (Auto)", "Picks the best available server for you", settings.preferredCountry == "AUTO") {
                         SettingsStore.update { it.copy(preferredCountry = "AUTO") }; showPicker = false
                     }
                     if (countries.isEmpty()) {
-                        Text("Countries appear after the first node update. Connect once in Auto mode.",
+                        Text(
+                            if (poolBusy) "Servers are being downloaded. Countries appear here in a few seconds."
+                            else "Countries appear after the first server update. Connect once with Auto.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 10.dp))
+                            modifier = Modifier.padding(top = 10.dp)
+                        )
                     }
                     countries.forEach { (cc, n) ->
-                        PickerRow("${Geo.flag(cc)} ${Geo.name(cc)}", "$n node${if (n == 1) "" else "s"}", settings.preferredCountry == cc) {
+                        PickerRow("${Geo.flag(cc)} ${Geo.name(cc)}", "$n server${if (n == 1) "" else "s"}", settings.preferredCountry == cc) {
                             SettingsStore.update { it.copy(preferredCountry = cc) }; showPicker = false
                         }
                     }
@@ -303,11 +238,15 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
 
 @Composable
 private fun PickerRow(title: String, subtitle: String, selected: Boolean, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier.fillMaxWidth().clickable(role = Role.RadioButton, onClick = onClick).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.titleMedium, color = if (selected) SgGreen else Color.White)
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        if (selected) Text("✓", color = SgGreen, style = MaterialTheme.typography.titleMedium)
     }
 }
 
@@ -320,27 +259,34 @@ private fun ConnectButton(status: Status, warn: Boolean, onClick: () -> Unit) {
     )
     val connected = status == Status.CONNECTED
     val connecting = status == Status.CONNECTING
-    val ringColor = when (status) {
-        Status.CONNECTED -> if (warn) SgOrange else SgGreen
+    val accent = if (warn) SgOrange else SgGreen
+    // Idle: light-grey icon on near-black with a visible ring (contrast above 3:1), never a dark-on-dark icon.
+    val ring = when (status) {
+        Status.CONNECTED -> accent
         Status.ERROR -> SgDanger
         Status.CONNECTING -> SgGreenSoft
-        else -> Color(0xFF3A3A3A)
+        else -> Color(0xFF6E6E6E)
     }
-    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(210.dp)) {
+    val iconTint = when {
+        connected -> Color.Black
+        status == Status.ERROR -> SgDanger
+        connecting -> SgGreenSoft
+        else -> Color(0xFFE0E0E0)
+    }
+    val label = if (status == Status.DISCONNECTED || status == Status.ERROR) "Connect" else "Disconnect"
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(220.dp)) {
         Box(
-            Modifier.size(210.dp).alpha(if (connecting) pulse else if (connected) 0.25f else 0f)
-                .clip(CircleShape).background(if (warn) SgOrange else SgGreen)
+            Modifier.size(220.dp).alpha(if (connecting) pulse else if (connected) 0.25f else 0f)
+                .clip(CircleShape).background(accent)
         )
         Box(
-            Modifier.size(172.dp).clip(CircleShape)
-                .background(if (connected) (if (warn) SgOrange else SgGreen) else Color(0xFF0E0E0E))
-                .clickable(onClick = onClick),
+            Modifier.size(176.dp).clip(CircleShape)
+                .background(if (connected) accent else Color(0xFF0E0E0E))
+                .border(3.dp, ring, CircleShape)
+                .clickable(role = Role.Button, onClickLabel = label, onClick = onClick),
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                Icons.Rounded.PowerSettingsNew, contentDescription = "Connect",
-                tint = if (connected) Color.Black else ringColor, modifier = Modifier.size(76.dp)
-            )
+            Icon(Icons.Rounded.PowerSettingsNew, contentDescription = label, tint = iconTint, modifier = Modifier.size(76.dp))
         }
     }
 }

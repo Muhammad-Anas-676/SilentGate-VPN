@@ -50,7 +50,7 @@ import kotlinx.coroutines.launch
 private data class Check(val title: String, val ok: Boolean?, val detail: String)
 
 @Composable
-fun ToolsScreen() {
+fun ToolsScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val status by VpnState.status.collectAsState()
     val clipboard = LocalClipboardManager.current
@@ -65,12 +65,7 @@ fun ToolsScreen() {
     var siteSteps by remember { mutableStateOf<List<Net.SiteStep>>(emptyList()) }
 
     Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
-        Text("Tools", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 16.dp))
-        Text(
-            "Geo-verification and leak checker. Connect first so the tests describe your tunnel.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp)
-        )
+        ScreenHeader("Network diagnostics", onBack, "Geo-verification, leak checker and site test. Connect first so the tests describe your tunnel.")
 
         SectionTitle("Leak and exit check")
         Button(
@@ -98,7 +93,7 @@ fun ToolsScreen() {
 
                     val v6 = Net.ipv6Probe()
                     out += if (v6 == null) Check("IPv6 leak", true, "No IPv6 address is exposed")
-                    else Check("IPv6 leak", false, "IPv6 reachable as $v6. Set IPv6 to Block in Settings if this is your real address")
+                    else Check("IPv6 leak", false, "IPv6 reachable as $v6. Set IPv6 to Block in Settings > Advanced if this is your real address")
                     checks = out.toList()
                     running = false
                 }
@@ -141,7 +136,7 @@ fun ToolsScreen() {
         SectionTitle("Cloudflare address scanner")
         SgCardBox {
             Text(
-                "Tests which Cloudflare edge addresses answer on port 443 from this network. Useful for picking a clean address for a Worker profile. WARP endpoints are scanned automatically by the core when the scanner is on in Settings. Run this while disconnected for the most useful result.",
+                "Tests which Cloudflare edge addresses answer on port 443 from this network. Useful for picking a clean address for a Worker profile. WARP endpoints are scanned automatically by the core when the scanner is on in Settings > Advanced > WARP settings. Run this while disconnected for the most useful result.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(10.dp))
@@ -225,12 +220,6 @@ fun ToolsScreen() {
             }
         }
 
-        SectionTitle("Event log")
-        val log by VpnState.log.collectAsState()
-        SgCardBox {
-            if (log.isEmpty()) Text("Nothing yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            log.takeLast(25).forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        }
         MadeByAnas()
     }
 }

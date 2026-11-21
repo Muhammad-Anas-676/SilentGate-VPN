@@ -30,10 +30,10 @@ This data is kept in the App's private storage. Uninstalling the App deletes it.
 We do not collect your name, e-mail address, phone number, location, contacts, advertising ID, browsing history, traffic content, DNS queries or connection timestamps. We cannot see them and have nowhere to send them.
 
 # 3. Network requests the App makes
-When you connect or use the Tools tab, your device contacts third parties directly:
+When you connect or use the diagnostics tools (Settings > Advanced), your device contacts third parties directly:
 - Cloudflare (WARP registration and tunnel, connectivity check at 1.1.1.1).
 - The encrypted DNS provider you select (Cloudflare, Quad9 or AdGuard).
-- Diagnostic services used by the Tools tab and exit check: ipwho.is, edns.ip-api.com and api6.ipify.org. These see the IP address of your VPN exit, not your real address, when the tunnel is up.
+- Diagnostic services used by the diagnostics tools (Settings > Advanced) and the exit check: ipwho.is, edns.ip-api.com and api6.ipify.org. These see the IP address of your VPN exit, not your real address, when the tunnel is up.
 - Any server named in a Stealth profile you import.
 - Public subscription hosts (for example GitHub or the jsDelivr CDN) that serve the community node lists, and the community nodes themselves when you connect through one. Community nodes are run by third parties: they can see which servers you contact and when, and the App cannot control or audit them. Do not rely on them for highly sensitive activity.
 - Public DNS-over-HTTPS resolvers (Cloudflare, Quad9, AdGuard, Google) contacted directly to look up server names before the tunnel starts.
@@ -260,7 +260,7 @@ Nothing. The App has no developer-operated backend, so there are no server logs 
 - Cloudflare, when you use WARP or the connectivity check.
 - Your selected DNS provider, for the queries it resolves.
 - Any server or Worker you configure.
-- Diagnostic services in the Tools tab.
+- Diagnostic services in Settings > Advanced.
 
 # Statement limits
 "No developer logs" describes the developer and the App only. It is not a promise about third-party providers, and it is not a claim of anonymity.

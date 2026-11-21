@@ -10,11 +10,11 @@ import org.json.JSONObject
 import java.util.UUID
 
 enum class ConnectMode(val label: String, val hint: String) {
-    AUTO("Smart Auto", "Your own server, then community nodes in safe countries, then WARP. It never falls back to an unmasked connection."),
+    AUTO("Smart Auto", "Private server first, then community nodes in safe countries, then WARP as a backup. It never falls back to an unmasked connection."),
     NODES("Nodes", "Community nodes only, with automatic failover and safe exit countries."),
     WARP("WARP", "Obfuscated Cloudflare WARP only. Websites may see an exit near your own country."),
     WARP_NODE("WARP + Node", "WARP chained through a node, so the exit follows the node instead of your ISP's country (experimental)."),
-    MY_SERVER("My server", "Your own VLESS / Trojan / Hysteria2 / WireGuard profile from the Profiles tab."),
+    MY_SERVER("My server", "Your own VLESS / Trojan / Hysteria2 / WireGuard profile from Advanced > Custom profiles."),
     DPI_ONLY("DPI only", "Unblocks filtered sites with TLS fragmentation. It does NOT hide your IP address or country.")
 }
 
@@ -39,6 +39,9 @@ enum class Ipv6Mode(val label: String) { BLOCK("Block (safest)"), TUNNEL("Tunnel
 
 const val CONSENT_VERSION = 2
 
+/** Bumped when defaults change; older saved settings are migrated once (see [AppSettings.fromJson]). */
+const val SETTINGS_SCHEMA = 2
+
 data class AppSettings(
     val consentVersion: Int = 0,
     val consentTime: Long = 0L,
@@ -51,7 +54,8 @@ data class AppSettings(
     val ipv6: Ipv6Mode = Ipv6Mode.BLOCK,
     val fragSize: String = "10-30",
     val fragSleep: String = "2-8",
-    val fragmentStealth: Boolean = true,
+    /** Off by default: fragmenting every proxy TLS handshake stalls media sites that open many parallel connections. */
+    val fragmentStealth: Boolean = false,
     val splitMode: SplitMode = SplitMode.OFF,
     val splitPackages: Set<String> = emptySet(),
     val activeProfileId: String? = null,
@@ -62,7 +66,11 @@ data class AppSettings(
     val preferredCountry: String = "AUTO",
     val avoidRestricted: Boolean = true,
     val allowHomeExit: Boolean = false,
-    val quic: QuicMode = QuicMode.AUTO
+    /** Block by default: UDP/443 is rejected inside the tunnel so browsers use TCP, which carries thumbnails reliably. */
+    val quic: QuicMode = QuicMode.BLOCK,
+    /** Try the private (built-in or user supplied) primary server before anything else in Smart Auto. */
+    val primaryFirst: Boolean = true,
+    val schema: Int = SETTINGS_SCHEMA
 ) {
     val consented: Boolean get() = consentVersion >= CONSENT_VERSION
 
@@ -88,6 +96,8 @@ data class AppSettings(
         put("avoidRestricted", avoidRestricted)
         put("allowHomeExit", allowHomeExit)
         put("quic", quic.name)
+        put("primaryFirst", primaryFirst)
+        put("schema", schema)
     }
 
     companion object {
@@ -98,10 +108,14 @@ data class AppSettings(
             val d = AppSettings()
             val pk = o.optJSONArray("splitPackages")
             val pkgs = buildSet { if (pk != null) for (i in 0 until pk.length()) add(pk.getString(i)) }
+            // Settings written by v1.1.x: the old defaults (fragmentation on, QUIC "Smart") caused stalled thumbnails,
+            // and the connection mode is no longer visible on Home, so a stale mode would be a hidden surprise.
+            val migrate = o.optInt("schema", 1) < SETTINGS_SCHEMA
+            val savedQuic = o.enumOr("quic", d.quic)
             return AppSettings(
                 consentVersion = o.optInt("consentVersion", 0),
                 consentTime = o.optLong("consentTime", 0L),
-                mode = o.enumOr("mode", d.mode),   // an old "LIGHT" value falls back to Smart Auto
+                mode = if (migrate) d.mode else o.enumOr("mode", d.mode),
                 warpTunnel = o.enumOr("warpTunnel", d.warpTunnel),
                 noise = o.optBoolean("noise", d.noise),
                 scanner = o.optBoolean("scanner", d.scanner),
@@ -110,7 +124,7 @@ data class AppSettings(
                 ipv6 = o.enumOr("ipv6", d.ipv6),
                 fragSize = o.optString("fragSize", d.fragSize),
                 fragSleep = o.optString("fragSleep", d.fragSleep),
-                fragmentStealth = o.optBoolean("fragmentStealth", d.fragmentStealth),
+                fragmentStealth = if (migrate) d.fragmentStealth else o.optBoolean("fragmentStealth", d.fragmentStealth),
                 splitMode = o.enumOr("splitMode", d.splitMode),
                 splitPackages = pkgs,
                 activeProfileId = if (o.isNull("activeProfileId")) null else o.optString("activeProfileId"),
@@ -119,7 +133,9 @@ data class AppSettings(
                 preferredCountry = o.optString("preferredCountry", d.preferredCountry).ifEmpty { "AUTO" },
                 avoidRestricted = o.optBoolean("avoidRestricted", d.avoidRestricted),
                 allowHomeExit = o.optBoolean("allowHomeExit", d.allowHomeExit),
-                quic = o.enumOr("quic", d.quic)
+                quic = if (migrate) (if (savedQuic == QuicMode.ALLOW) QuicMode.ALLOW else QuicMode.BLOCK) else savedQuic,
+                primaryFirst = o.optBoolean("primaryFirst", d.primaryFirst),
+                schema = SETTINGS_SCHEMA
             )
         }
     }
@@ -134,7 +150,11 @@ object SettingsStore {
     fun init(ctx: Context) {
         prefs = ctx.getSharedPreferences("silentgate_settings", Context.MODE_PRIVATE)
         val raw = prefs.getString("settings", null)
-        if (raw != null) runCatching { _flow.value = AppSettings.fromJson(JSONObject(raw)) }
+        if (raw != null) runCatching {
+            val loaded = AppSettings.fromJson(JSONObject(raw))
+            _flow.value = loaded
+            prefs.edit().putString("settings", loaded.toJson().toString()).apply()
+        }
     }
 
     fun update(block: (AppSettings) -> AppSettings) {

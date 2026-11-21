@@ -26,6 +26,8 @@ object VpnState {
     val status = MutableStateFlow(Status.DISCONNECTED)
     val layer = MutableStateFlow<ConfigBuilder.Layer?>(null)
     val protection = MutableStateFlow(Protection.NONE)
+    /** True when Smart Auto ended on WARP as a last resort (no remote node worked). */
+    val backup = MutableStateFlow(false)
     val node = MutableStateFlow("")
     val nodeCc = MutableStateFlow("")
     val message = MutableStateFlow("")
@@ -47,6 +49,7 @@ object VpnState {
         rxSpeed.value = 0; txSpeed.value = 0; sessionRx.value = 0; sessionTx.value = 0
         exit.value = null
         protection.value = Protection.NONE
+        backup.value = false
         node.value = ""
         nodeCc.value = ""
     }

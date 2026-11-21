@@ -13,6 +13,12 @@ object Geo {
     /** Exit regions we prefer, best first. Order only matters for ranking; verification decides the rest. */
     val SAFE_PRIORITY = listOf("NL", "CH", "SG", "CA", "JP", "RO", "FI", "SE", "NO", "AT", "CZ", "PL", "LU", "IS", "HK", "US")
 
+    /**
+     * Countries offered in the location picker: the safe-exit list without the US, because many US states enforce age
+     * verification and an exit there would randomly be rejected after connecting.
+     */
+    val PICKER_COUNTRIES: List<String> = SAFE_PRIORITY.filter { it != "US" }
+
     private val NAMES = mapOf(
         "NL" to "Netherlands", "CH" to "Switzerland", "SG" to "Singapore", "CA" to "Canada", "JP" to "Japan",
         "RO" to "Romania", "FI" to "Finland", "SE" to "Sweden", "NO" to "Norway", "AT" to "Austria",

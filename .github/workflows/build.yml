@@ -104,6 +104,9 @@ jobs:
       - name: Build release APK (with retries)
         env:
           GRADLE_OPTS: -Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000
+          # Optional private primary server (share link(s), space separated). Add it as a repository secret named
+          # SG_PRIMARY_SERVER; GitHub masks it in logs. Leave the secret unset for a build without a built-in server.
+          SG_PRIMARY_SERVER: ${{ secrets.SG_PRIMARY_SERVER }}
         run: |
           for attempt in 1 2 3; do
             echo "::group::Attempt $attempt"

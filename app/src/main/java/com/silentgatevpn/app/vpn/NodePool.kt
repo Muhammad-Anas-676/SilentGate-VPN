@@ -1,6 +1,9 @@
 package com.silentgatevpn.app.vpn
 
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -34,7 +37,9 @@ data class Node(
     val lastOkAt: Long = 0L,
     val lastFailAt: Long = 0L,
     val fails: Int = 0,
-    val latencyMs: Long = -1L
+    val latencyMs: Long = -1L,
+    /** Median time of the last parallel media test in ms (-1 = never measured). Slow nodes are ranked down. */
+    val mediaMs: Long = -1L
 ) {
     /** Best known country: what the node was measured to exit in, else what its name claims. */
     val cc: String get() = exitCc.ifEmpty { ccHint }
@@ -43,14 +48,15 @@ data class Node(
         .put("id", id).put("raw", raw).put("name", name).put("protocol", protocol).put("server", server)
         .put("port", port).put("transport", transport).put("security", security).put("udp", udp)
         .put("ccHint", ccHint).put("source", source).put("exitCc", exitCc).put("exitRc", exitRc)
-        .put("lastOkAt", lastOkAt).put("lastFailAt", lastFailAt).put("fails", fails).put("latencyMs", latencyMs)
+        .put("lastOkAt", lastOkAt).put("lastFailAt", lastFailAt).put("fails", fails).put("latencyMs", latencyMs).put("mediaMs", mediaMs)
 
     companion object {
         fun fromJson(o: JSONObject): Node = Node(
             o.getString("id"), o.getString("raw"), o.optString("name"), o.optString("protocol"), o.optString("server"),
             o.optInt("port"), o.optString("transport"), o.optString("security"), o.optBoolean("udp"),
             o.optString("ccHint"), o.optString("source"), o.optString("exitCc"), o.optString("exitRc"),
-            o.optLong("lastOkAt"), o.optLong("lastFailAt"), o.optInt("fails"), o.optLong("latencyMs", -1L)
+            o.optLong("lastOkAt"), o.optLong("lastFailAt"), o.optInt("fails"), o.optLong("latencyMs", -1L),
+            o.optLong("mediaMs", -1L)
         )
     }
 }
@@ -71,9 +77,16 @@ object NodePool {
     private const val MAX_BODY_BYTES = 3_500_000
     const val STALE_MS = 6L * 3600_000L
 
+    /** Nodes whose parallel media test is slower than this are ranked far down; above [SKIP_MEDIA_MS] they cool down. */
+    private const val SLOW_MEDIA_MS = 2_000L
+    private const val SKIP_MEDIA_MS = 3_500L
+    private const val SLOW_LATENCY_MS = 1_500L
+
+    private val warmScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     // Public, community-maintained feeds that publish Base64 / plain link lists. They are third-party data: the app
     // drops insecure nodes (no TLS, certificate checks off) and verifies every exit before showing "Protected".
-    // Editable in the Profiles tab; remove anything you do not trust.
+    // Editable in Advanced > Custom profiles; remove anything you do not trust.
     private val DEFAULT_SUBS = listOf(
         "https://github.com/Au1rxx/free-vpn-subscriptions/raw/main/output/v2ray-base64.txt" to "Free VPN Subscriptions (health-checked)",
         "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt" to "Free V2Ray Public List (VLESS)",
@@ -214,7 +227,7 @@ object NodePool {
                 val prev = old[n.id]
                 merged.add(if (prev != null) n.copy(
                     exitCc = prev.exitCc, exitRc = prev.exitRc, lastOkAt = prev.lastOkAt,
-                    lastFailAt = prev.lastFailAt, fails = prev.fails, latencyMs = prev.latencyMs
+                    lastFailAt = prev.lastFailAt, fails = prev.fails, latencyMs = prev.latencyMs, mediaMs = prev.mediaMs
                 ) else n)
             }
             // Keep proven nodes that dropped out of the feeds for a while, they may still work.
@@ -284,6 +297,18 @@ object NodePool {
 
     fun isStale(): Boolean = System.currentTimeMillis() - _updatedAt.value > STALE_MS || _nodes.value.size < 8
 
+    /**
+     * Fire-and-forget refresh used right after the user accepts the welcome screen (and at app start), so the nodes
+     * are already downloaded and filtered before the first tap on Connect. Safe to call repeatedly: [refresh]
+     * ignores a call while another one is running. It deliberately does NOT measure the home IP: that must only
+     * happen right before the tunnel starts, never in the background (it could be mistaken for the VPN exit IP).
+     */
+    fun prewarm() {
+        warmScope.launch {
+            if (SettingsStore.value.communityNodes && isStale()) runCatching { refresh() }
+        }
+    }
+
     /** Downloads every enabled feed (two at a time to stay light on a low-RAM phone) and merges the result. */
     suspend fun refresh(): Int {
         if (!_refreshing.compareAndSet(false, true)) return _nodes.value.size
@@ -345,6 +370,8 @@ object NodePool {
         val idx = Geo.SAFE_PRIORITY.indexOf(n.cc)
         if (idx >= 0) s += (20 - idx).coerceAtLeast(2).toDouble()
         if (n.latencyMs in 1..4000) s -= n.latencyMs / 60.0
+        if (n.latencyMs > SLOW_LATENCY_MS) s -= 25.0
+        if (n.mediaMs > 0) s -= (n.mediaMs / 40.0).coerceAtMost(70.0)   // 2 s median = -50, 3.5 s = -70
         s -= n.fails * 30.0
         return s + Math.random() * 6.0
     }
@@ -361,6 +388,8 @@ object NodePool {
         val now = System.currentTimeMillis()
         var list = _nodes.value.filter { it.id !in avoid && !knownBad(it, s, home) }
         list = list.filter { !(it.fails >= 3 && now - it.lastFailAt < 30 * 60_000L) }
+        // Overloaded: slow in the parallel media test AND failed recently, so give it a 30 minute rest.
+        list = list.filter { !(it.mediaMs > SKIP_MEDIA_MS && it.fails >= 1 && now - it.lastFailAt < 30 * 60_000L) }
         val pref = s.preferredCountry
         if (pref != "AUTO") {
             val matching = list.filter { it.cc == pref }
@@ -381,8 +410,24 @@ object NodePool {
 
     fun get(id: String): Node? = _nodes.value.firstOrNull { it.id == id }
 
-    fun markOk(id: String, exitCc: String, exitRc: String, latencyMs: Long) {
-        update(id) { it.copy(exitCc = exitCc.ifEmpty { it.exitCc }, exitRc = exitRc.ifEmpty { it.exitRc }, lastOkAt = System.currentTimeMillis(), fails = 0, latencyMs = latencyMs) }
+    fun markOk(id: String, exitCc: String, exitRc: String, latencyMs: Long, mediaMs: Long = -1L) {
+        update(id) {
+            it.copy(
+                exitCc = exitCc.ifEmpty { it.exitCc }, exitRc = exitRc.ifEmpty { it.exitRc },
+                lastOkAt = System.currentTimeMillis(), fails = 0, latencyMs = latencyMs,
+                mediaMs = if (mediaMs > 0) mediaMs else it.mediaMs
+            )
+        }
+    }
+
+    /** Remembers a slow pre-flight so the node is ranked down next time (rare, so the extra disk write is fine). */
+    fun markLatency(id: String, latencyMs: Long) {
+        update(id) { it.copy(latencyMs = latencyMs) }
+    }
+
+    /** Records the parallel media median (also for rejected nodes) so overloaded nodes sink in the ranking. */
+    fun markMedia(id: String, mediaMs: Long) {
+        if (mediaMs > 0) update(id) { it.copy(mediaMs = mediaMs) }
     }
 
     fun markExit(id: String, exitCc: String, exitRc: String) {

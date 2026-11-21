@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -52,6 +51,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.silentgatevpn.app.legal.LegalDoc
 import com.silentgatevpn.app.legal.LegalDocs
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextDecoration
+import com.silentgatevpn.app.vpn.NodePool
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -105,80 +111,90 @@ fun DocLinkRow(doc: LegalDoc, onClick: () -> Unit) {
     }
 }
 
+/** One-screen welcome: a single checkbox and a Continue button, so a first-time user reaches Connect in seconds. */
 @Composable
 fun ConsentScreen(onOpenDoc: (LegalDoc) -> Unit, onAccept: () -> Unit) {
-    var adult by remember { mutableStateOf(false) }
     var agree by remember { mutableStateOf(false) }
-    val checkColors = CheckboxDefaults.colors(
-        checkedColor = SgGreen, checkmarkColor = Color.Black, uncheckedColor = Color(0xFFB0B0B0)
-    )
+    var showAll by remember { mutableStateOf(false) }
     val onBg = MaterialTheme.colorScheme.onBackground
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
 
-    Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
-        LazyColumn(
-            Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            item {
-                Spacer(Modifier.height(28.dp))
-                Image(
-                    painter = painterResource(R.drawable.ic_launcher_foreground),
-                    contentDescription = "SilentGate VPN",
-                    modifier = Modifier.size(112.dp)
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Spacer(Modifier.height(24.dp))
+        Image(
+            painter = painterResource(R.drawable.ic_launcher_foreground),
+            contentDescription = "SilentGate VPN",
+            modifier = Modifier.size(104.dp)
+        )
+        Spacer(Modifier.height(12.dp))
+        Text("SilentGate VPN", style = MaterialTheme.typography.headlineMedium, color = onBg, textAlign = TextAlign.Center)
+        Text(
+            "Private, one-tap VPN. No ads, no accounts, no analytics.",
+            style = MaterialTheme.typography.bodyMedium, color = dim, textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 24.dp)
+        )
+
+        SgCardBox {
+            Row(
+                Modifier.fillMaxWidth().clickable(role = Role.Checkbox) { agree = !agree },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Checkbox(
+                    checked = agree, onCheckedChange = { agree = it },
+                    colors = CheckboxDefaults.colors(checkedColor = SgGreen, checkmarkColor = Color.Black, uncheckedColor = Color(0xFFB0B0B0))
                 )
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    "Welcome to SilentGate VPN", style = MaterialTheme.typography.headlineMedium,
-                    color = onBg, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
-                )
-                Text(
-                    "Please read how the app works and what you agree to. No ads, no accounts, no analytics.",
-                    style = MaterialTheme.typography.bodyMedium, color = dim, textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 20.dp)
-                )
+                Text("I am 18+ and agree to the Terms & Privacy Policy", style = MaterialTheme.typography.bodyMedium, color = onBg)
             }
-            items(LegalDocs.all.size) { i ->
-                val doc = LegalDocs.all[i]
-                Card(
-                    onClick = { onOpenDoc(doc) },
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = SgCard, contentColor = onBg),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-                ) {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(doc.title, style = MaterialTheme.typography.titleMedium, color = onBg)
-                            Text(doc.summary, style = MaterialTheme.typography.bodySmall, color = dim, modifier = Modifier.padding(top = 2.dp))
-                        }
-                        Icon(Icons.Rounded.ChevronRight, contentDescription = null, tint = SgGreen)
-                    }
+            Row(Modifier.padding(start = 12.dp, top = 4.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                LegalLink("Terms of Service") { onOpenDoc(LegalDocs.tos) }
+                LegalLink("Privacy Policy") { onOpenDoc(LegalDocs.privacy) }
+            }
+            Row(Modifier.padding(start = 12.dp)) { LegalLink("All legal documents") { showAll = true } }
+            Text(
+                "Continuing also accepts the Acceptable Use Policy, Disclaimer and the other documents listed there.",
+                style = MaterialTheme.typography.bodySmall, color = dim, modifier = Modifier.padding(start = 12.dp, top = 4.dp)
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        Button(
+            onClick = {
+                // Download and filter the node list now, so it is ready before the first tap on Connect.
+                NodePool.prewarm()
+                onAccept()
+            },
+            enabled = agree, modifier = Modifier.fillMaxWidth().height(52.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = SgGreen, contentColor = Color.Black,
+                disabledContainerColor = Color(0xFF1C1C1C), disabledContentColor = Color(0xFF9A9A9A)
+            )
+        ) { Text("Continue", fontWeight = FontWeight.Bold) }
+        Spacer(Modifier.height(24.dp))
+    }
+
+    if (showAll) {
+        AlertDialog(
+            onDismissRequest = { showAll = false },
+            containerColor = Color(0xFF121212),
+            title = { Text("Legal documents") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    LegalDocs.all.forEach { doc -> DocLinkRow(doc) { showAll = false; onOpenDoc(doc) } }
                 }
-            }
-            item { Spacer(Modifier.height(8.dp)) }
-        }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
-            Row(Modifier.fillMaxWidth().clickable { adult = !adult }, verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = adult, onCheckedChange = { adult = it }, colors = checkColors)
-                Text("I am 18 years old or older.", style = MaterialTheme.typography.bodyMedium, color = onBg)
-            }
-            Row(Modifier.fillMaxWidth().clickable { agree = !agree }, verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = agree, onCheckedChange = { agree = it }, colors = checkColors)
-                Text(
-                    "I have read and agree to the Terms of Service, Terms of Use, Terms and Conditions, Acceptable Use Policy, Disclaimer and Privacy Policy.",
-                    style = MaterialTheme.typography.bodyMedium, color = onBg
-                )
-            }
-            Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = onAccept, enabled = adult && agree, modifier = Modifier.fillMaxWidth().height(52.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = SgGreen, contentColor = Color.Black,
-                    disabledContainerColor = Color(0xFF1C1C1C), disabledContentColor = Color(0xFF9A9A9A)
-                )
-            ) { Text("Accept and continue", fontWeight = FontWeight.Bold) }
-        }
+            },
+            confirmButton = { TextButton(onClick = { showAll = false }) { Text("Close", color = SgGreen) } }
+        )
+    }
+}
+
+/** Underlined green link with a 48 dp touch target. */
+@Composable
+private fun LegalLink(text: String, onClick: () -> Unit) {
+    Box(Modifier.heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onClick), contentAlignment = Alignment.CenterStart) {
+        Text(text, color = SgGreen, textDecoration = TextDecoration.Underline, style = MaterialTheme.typography.bodyMedium)
     }
 }

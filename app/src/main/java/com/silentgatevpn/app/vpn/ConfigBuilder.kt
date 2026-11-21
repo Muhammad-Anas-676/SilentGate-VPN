@@ -7,6 +7,7 @@ object ConfigBuilder {
 
     /** [masksIp] decides whether the app may ever show "Protected" for this layer. */
     enum class Layer(val title: String, val timeoutMs: Long, val masksIp: Boolean) {
+        PRIMARY("Private server", 12_000, true),
         NODE("Smart Node", 7_000, true),
         MY_SERVER("My server", 15_000, true),
         WARP("Obfuscated WARP", 30_000, true),
@@ -31,10 +32,13 @@ object ConfigBuilder {
     /** How many progressively simpler configs exist for a layer (used when the core rejects an option). */
     fun variants(layer: Layer): Int = when (layer) {
         Layer.WARP, Layer.WARP_NODE -> 3
-        Layer.NODE, Layer.MY_SERVER, Layer.DPI_ONLY -> 2
+        Layer.PRIMARY, Layer.NODE, Layer.MY_SERVER, Layer.DPI_ONLY -> 2
     }
 
-    /** True when UDP/443 (QUIC / HTTP3) should be rejected so browsers fall back to TCP, which carries thumbnails reliably. */
+    /**
+     * True when UDP/443 (QUIC / HTTP3) should be rejected so browsers fall back to TCP, which carries thumbnails reliably.
+     * The default is [QuicMode.BLOCK]; "Smart" (per-node decision) and "Allow" are only reachable from Advanced settings.
+     */
     fun blockQuic(s: AppSettings, layer: Layer, proxy: ParsedProxy?): Boolean = when (s.quic) {
         QuicMode.BLOCK -> true
         QuicMode.ALLOW -> false
@@ -64,6 +68,9 @@ object ConfigBuilder {
 
         fun addProxy(tag: String) {
             val p = proxy ?: error("No proxy selected")
+            // tls_fragment is applied to proxy handshakes ONLY when the user switched it on in Advanced settings.
+            // (DPI_ONLY fragments its own "frag" outbound below.) It is off by default because splitting every
+            // proxy TLS hello makes dozens of parallel media connections slow or get reset.
             val frag = if (s.fragmentStealth && variant == 0) fragmentJson(s) else null
             val json = p.toJson(tag, frag, "dns-bootstrap", ctx.serverIp)
             if (p.isEndpoint || json.optString("type") in ENDPOINT_TYPES) endpoints.put(json) else outbounds.put(json)
@@ -85,7 +92,7 @@ object ConfigBuilder {
                 endpoints.put(warp)
                 "warp"
             }
-            Layer.NODE, Layer.MY_SERVER -> {
+            Layer.NODE, Layer.MY_SERVER, Layer.PRIMARY -> {
                 addProxy("proxy")
                 "proxy"
             }
