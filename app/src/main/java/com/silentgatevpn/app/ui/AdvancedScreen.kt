@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -54,7 +53,7 @@ private data class FragPreset(val label: String, val size: String, val sleep: St
 /** Header used by every sub-screen: back arrow, title and an optional one-line explanation. */
 @Composable
 fun ScreenHeader(title: String, onBack: () -> Unit, subtitle: String? = null) {
-    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+    Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = MaterialTheme.colorScheme.onSurface)
@@ -89,7 +88,7 @@ fun AdvancedScreen(
     val currentPreset = presets.firstOrNull { it.size == s.fragSize && it.sleep == s.fragSleep } ?: presets[1]
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
 
-    Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 12.dp)) {
         ScreenHeader("Advanced", onBack, "For power users. Changes apply the next time you connect.")
 
         SectionTitle("Connection mode")
@@ -248,7 +247,7 @@ private fun PrimaryServerDialog(onDismiss: () -> Unit) {
 fun EventLogScreen(onBack: () -> Unit) {
     val log by VpnState.log.collectAsState()
     val clipboard = LocalClipboardManager.current
-    Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 12.dp)) {
         ScreenHeader("Event log", onBack, "Kept in memory only and cleared when the app closes.")
         Spacer(Modifier.height(12.dp))
         SgCardBox {

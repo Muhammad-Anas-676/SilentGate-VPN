@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -64,7 +63,7 @@ fun ToolsScreen(onBack: () -> Unit) {
     var siteRunning by remember { mutableStateOf(false) }
     var siteSteps by remember { mutableStateOf<List<Net.SiteStep>>(emptyList()) }
 
-    Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 12.dp)) {
         ScreenHeader("Network diagnostics", onBack, "Geo-verification, leak checker and site test. Connect first so the tests describe your tunnel.")
 
         SectionTitle("Leak and exit check")

@@ -215,6 +215,10 @@ object Net {
     }
 
     @Volatile private var bootstrap: List<DnsProvider> = DnsProvider.entries
+
+    /** Resolvers that really answered the last bootstrap probe, fastest first (empty when none did). */
+    @Volatile var answeredDns: List<DnsProvider> = emptyList()
+        private set
     private val dnsCache = ConcurrentHashMap<String, Pair<String, Long>>()
 
     /**
@@ -238,6 +242,7 @@ object Net {
             order + DnsProvider.entries.filter { it !in order }
         }
         bootstrap = result
+        answeredDns = order.toList()
         VpnState.log("Bootstrap DNS: " + (if (order.isEmpty()) "none answered" else order.joinToString { it.server }))
         return result
     }
@@ -295,7 +300,31 @@ object Net {
     // Mainstream uncensored endpoints that family-filter DNS, cloud WAFs and ISP blocklists commonly hit. Only
     // /robots.txt is requested (a few hundred bytes of text); a node is rejected only when ALL of them are blocked
     // or when DNS for any of them is poisoned.
-    private val CONTENT_HOSTS = listOf("www.pornhub.com", "xhamster.com")
+    private val CONTENT_HOSTS = listOf("www.pornhub.com", "xhamster.com", "zooporn.show")
+
+    // Text that Pakistani ISP / PTA block pages (and similar national filters) contain. A node whose exit, or whose
+    // resolver, returns one of these for a probe host is rejected immediately, however many other hosts load.
+    private val BLOCK_PAGE_SIGNS = listOf(
+        "page cannot be displayed", "contact your service provider", "pakistan telecommunication",
+        "pta.gov.pk", "blocked as per", "has been blocked", "access to this site is blocked",
+        "this website is blocked", "blocked by order"
+    )
+    private val BLOCK_PAGE_WORD = Regex("\\bpta\\b")
+    private val BLOCK_HOST_HINTS = listOf("pta.gov.pk", "ptcl", "blocked", "blockpage", "block-page", "warning.", "filter.")
+
+    private fun looksLikeBlockPage(text: String): Boolean {
+        val low = text.lowercase()
+        return BLOCK_PAGE_SIGNS.any { low.contains(it) } || BLOCK_PAGE_WORD.containsMatchIn(low)
+    }
+
+    /** A redirect that leaves the probed site for an ISP / regulator host is a block page, not the site. */
+    private fun blockRedirect(host: String, location: String): Boolean {
+        if (location.isEmpty()) return false
+        val target = runCatching { URL(URL("https://$host/"), location).host.lowercase() }.getOrDefault("")
+        val base = host.lowercase().removePrefix("www.")
+        if (target.isEmpty() || target == host.lowercase() || target.endsWith(base)) return false
+        return looksLikeBlockPage(location) || BLOCK_HOST_HINTS.any { target.contains(it) }
+    }
 
     private suspend fun anyOk(urls: List<String>, timeoutMs: Int): Boolean = coroutineScope {
         urls.map { u -> async(Dispatchers.IO) { runCatching { http(u, timeoutMs) }.isSuccess } }.awaitAll().any { it }
@@ -343,7 +372,10 @@ object Net {
     private fun looksPoisoned(a: InetAddress): Boolean =
         a.isAnyLocalAddress || a.isLoopbackAddress || a.isSiteLocalAddress || a.isLinkLocalAddress
 
-    /** 1 = reachable, 0 = soft (challenge / rate limit / site error: a real browser can still pass), -1 = blocked, -2 = DNS poisoned. */
+    /**
+     * 1 = reachable, 0 = soft (challenge / rate limit / site error: a real browser can still pass), -1 = blocked,
+     * -2 = DNS poisoned, -3 = ISP / PTA block page (body or redirect target).
+     */
     private suspend fun contentProbe(host: String, timeoutMs: Int): Pair<Int, String> = withContext(Dispatchers.IO) {
         val addrs = try {
             InetAddress.getAllByName(host).toList()
@@ -360,8 +392,17 @@ object Net {
             c.setRequestProperty("Accept", "*/*")
             val code = c.responseCode
             val mitigated = c.getHeaderField("cf-mitigated").orEmpty()
-            runCatching { (if (code >= 400) c.errorStream else c.inputStream)?.use { it.read(ByteArray(512)) } }
+            val location = c.getHeaderField("Location").orEmpty()
+            val body = runCatching {
+                (if (code >= 400) c.errorStream else c.inputStream)?.use { ins ->
+                    val b = ByteArray(4096)
+                    val n = ins.read(b)
+                    if (n > 0) String(b, 0, n, Charsets.UTF_8) else ""
+                }.orEmpty()
+            }.getOrDefault("")
             when {
+                code in 300..399 && blockRedirect(host, location) -> -3 to "$host: redirected to an ISP block page"
+                code != 451 && looksLikeBlockPage(body) -> -3 to "$host: ISP block page (HTTP $code)"
                 code in 200..399 -> 1 to "$host: HTTP $code"
                 code == 451 -> -1 to "$host: HTTP 451 (blocked)"
                 code == 403 && mitigated.equals("challenge", true) -> 0 to "$host: challenge page"
@@ -382,6 +423,8 @@ object Net {
      */
     suspend fun contentCheck(timeoutMs: Int = 6000): ContentResult = coroutineScope {
         val r = CONTENT_HOSTS.map { h -> async(Dispatchers.IO) { contentProbe(h, timeoutMs) } }.awaitAll()
+        val blockPage = r.firstOrNull { it.first == -3 }
+        if (blockPage != null) return@coroutineScope ContentResult(false, "ISP block page: ${blockPage.second}")
         val poisoned = r.firstOrNull { it.first == -2 }
         if (poisoned != null) return@coroutineScope ContentResult(false, "content filter: ${poisoned.second}")
         if (r.none { it.first >= 0 }) {

@@ -7,6 +7,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,7 +19,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -26,7 +26,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.PowerSettingsNew
-import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -45,11 +44,16 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import android.content.Intent
+import android.provider.Settings
+import androidx.compose.ui.platform.LocalContext
+import com.silentgatevpn.app.R
 import com.silentgatevpn.app.vpn.ConnectMode
 import com.silentgatevpn.app.vpn.Geo
 import com.silentgatevpn.app.vpn.Net
@@ -76,24 +80,38 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
     val sTx by VpnState.sessionTx.collectAsState()
     val settings by SettingsStore.flow.collectAsState()
     val poolBusy by NodePool.refreshing.collectAsState()
+    val poolNodes by NodePool.nodes.collectAsState()
+    val alwaysOnHint by VpnState.alwaysOnHint.collectAsState()
+    val context = LocalContext.current
     var showPicker by remember { mutableStateOf(false) }
 
     val connected = status == Status.CONNECTED
     val idle = status == Status.DISCONNECTED || status == Status.ERROR
     val warn = connected && (protection != Protection.FULL || backup)
 
-    // A saved country that is no longer offered (for example a restricted one from an older version) falls back to Auto.
-    LaunchedEffect(settings.preferredCountry) {
+    // A saved country that must not be used (home country, or a restricted one while "avoid restricted" is on)
+    // falls back to Auto. Any other country, including ones outside the safe list, stays selectable.
+    LaunchedEffect(settings.preferredCountry, settings.avoidRestricted, settings.allowHomeExit) {
         val pc = settings.preferredCountry
-        if (pc != "AUTO" && pc !in Geo.PICKER_COUNTRIES) SettingsStore.update { it.copy(preferredCountry = "AUTO") }
+        if (pc != "AUTO" && pc != Geo.OTHER &&
+            Geo.excludedReason(pc, "", Net.home.cc, settings.avoidRestricted, settings.allowHomeExit) != null
+        ) SettingsStore.update { it.copy(preferredCountry = "AUTO") }
+    }
+
+    // Opening the picker with no servers loaded yet starts a download in the background.
+    LaunchedEffect(showPicker) {
+        if (showPicker && settings.communityNodes && NodePool.nodes.value.isEmpty() && !NodePool.refreshing.value) {
+            runCatching { NodePool.refresh() }
+        }
     }
 
     Column(
-        Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Row(Modifier.fillMaxWidth().padding(top = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Rounded.Shield, contentDescription = null, tint = SgGreen, modifier = Modifier.size(28.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            // The real brand mark (green Wi-Fi shield), cropped to its artwork so it is not shrunk by the adaptive-icon padding.
+            Image(painterResource(R.drawable.ic_brand_logo), contentDescription = "SilentGate VPN", modifier = Modifier.size(34.dp))
             Spacer(Modifier.size(10.dp))
             Text("SilentGate VPN", style = MaterialTheme.typography.titleLarge)
         }
@@ -148,9 +166,10 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
         // Honest one-line notices: only when something is not the normal, fully private case.
         val notice: Pair<String, String>? = when {
             connected && protection == Protection.NONE -> "Not protected" to "Your IP address did not change. Disconnect and try again."
-            connected && backup -> "Backup connection" to "No server was available, so a backup route is used. Your IP is hidden, but sites may still treat you as being in your own country."
+            connected && backup -> "Backup connection" to "No server was available, so a backup route is used. Your IP is hidden, but sites blocked by your ISP need a remote server. If a site shows a block page, try again once servers load, and open it in Incognito (Chrome may have saved the old block page)."
             connected && protection == Protection.DPI_ONLY -> "Unblock-only mode" to "Your IP address is not hidden in this mode. You can change it in Settings › Advanced."
             connected && protection == Protection.GEO_LOCAL -> "Nearby location" to "Your IP is hidden, but this location is close to yours, so sites may show local content."
+            idle && alwaysOnHint -> "Always-on VPN is on" to "Android may keep the VPN icon or reconnect by itself. Turn it off in Android Settings › Network › VPN."
             idle && settings.mode != ConnectMode.AUTO -> "Advanced mode on" to "${settings.mode.label} is selected in Settings › Advanced. Switch back to Smart Auto for the normal 1-tap experience."
             else -> null
         }
@@ -168,6 +187,12 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
                     modifier = Modifier.padding(top = 4.dp)
                 )
             }
+        }
+
+        if (idle && alwaysOnHint) {
+            TextButton(onClick = {
+                runCatching { context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            }) { Text("Open VPN settings", color = SgGreen) }
         }
 
         Spacer(Modifier.height(24.dp))
@@ -206,34 +231,57 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
     }
 
     if (showPicker) {
-        val countries = NodePool.availableCountries(settings, Net.home).filterKeys { it in Geo.PICKER_COUNTRIES }
+        val data = remember(poolNodes, settings.avoidRestricted, settings.allowHomeExit) { NodePool.pickerData(settings, Net.home) }
+        fun choose(cc: String) { SettingsStore.update { it.copy(preferredCountry = cc) }; showPicker = false }
         AlertDialog(
             onDismissRequest = { showPicker = false },
             containerColor = Color(0xFF121212),
             title = { Text("Choose location") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
-                    PickerRow("⚡ Fastest Location (Auto)", "Picks the best available server for you", settings.preferredCountry == "AUTO") {
-                        SettingsStore.update { it.copy(preferredCountry = "AUTO") }; showPicker = false
-                    }
-                    if (countries.isEmpty()) {
+                    PickerRow("⚡ Fastest Location (Auto)", "Picks the best available server for you", settings.preferredCountry == "AUTO") { choose("AUTO") }
+                    if (data.isEmpty) {
                         Text(
-                            if (poolBusy) "Servers are being downloaded. Countries appear here in a few seconds."
-                            else "Countries appear after the first server update. Connect once with Auto.",
+                            if (poolBusy) "Servers are being downloaded. Locations appear here as soon as the first list arrives."
+                            else "No servers loaded yet. Updating now; if nothing appears, connect once with Auto.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 10.dp)
                         )
                     }
-                    countries.forEach { (cc, n) ->
-                        PickerRow("${Geo.flag(cc)} ${Geo.name(cc)}", "$n server${if (n == 1) "" else "s"}", settings.preferredCountry == cc) {
-                            SettingsStore.update { it.copy(preferredCountry = cc) }; showPicker = false
-                        }
+                    if (data.safe.isNotEmpty()) PickerSection("Safe Locations")
+                    data.safe.forEach { (cc, n) -> CountryRow(cc, n, settings.preferredCountry == cc, null) { choose(cc) } }
+                    if (data.other.isNotEmpty()) PickerSection("Other Locations")
+                    data.other.forEach { (cc, n) ->
+                        CountryRow(cc, n, settings.preferredCountry == cc, if (cc == "US") "Some states require age check" else null) { choose(cc) }
+                    }
+                    if (data.ageCheck.isNotEmpty()) PickerSection("May require age check")
+                    data.ageCheck.forEach { (cc, n) -> CountryRow(cc, n, settings.preferredCountry == cc, "May require age check") { choose(cc) } }
+                    if (data.unknown > 0) {
+                        PickerSection("Global / Other")
+                        PickerRow(
+                            "\uD83C\uDF10 Global / Other", "${data.unknown} server${if (data.unknown == 1) "" else "s"}, location checked after connecting",
+                            settings.preferredCountry == Geo.OTHER
+                        ) { choose(Geo.OTHER) }
                     }
                 }
             },
             confirmButton = { TextButton(onClick = { showPicker = false }) { Text("Close", color = SgGreen) } }
         )
     }
+}
+
+@Composable
+private fun PickerSection(title: String) {
+    Text(
+        title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 14.dp, bottom = 2.dp)
+    )
+}
+
+@Composable
+private fun CountryRow(cc: String, n: Int, selected: Boolean, tag: String?, onClick: () -> Unit) {
+    val count = "$n server${if (n == 1) "" else "s"}"
+    PickerRow("${Geo.flag(cc)} ${Geo.name(cc)}", if (tag != null) "$count · $tag" else count, selected, onClick)
 }
 
 @Composable

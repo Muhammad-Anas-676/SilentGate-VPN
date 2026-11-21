@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -82,8 +81,8 @@ fun AppsScreen() {
     val modes = SplitMode.entries
     val short = mapOf(SplitMode.OFF to "Off", SplitMode.EXCLUDE to "Bypass", SplitMode.ONLY to "Only")
 
-    Column(Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 20.dp)) {
-        Text("Apps", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(top = 16.dp))
+    Column(Modifier.fillMaxSize().padding(start = 20.dp, end = 20.dp, top = 12.dp)) {
+        Text("Apps", style = MaterialTheme.typography.headlineMedium, modifier = Modifier)
         Text(
             "Split tunnelling. Bypass: selected apps skip the VPN (good for banking and local apps). Only: just the selected apps use the VPN.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,

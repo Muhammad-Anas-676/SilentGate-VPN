@@ -1,5 +1,6 @@
 package com.silentgatevpn.app.vpn
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -7,6 +8,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,6 +21,8 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 
 /** A proxy node kept in the pool. Stats are updated after every connection attempt. */
 data class Node(
@@ -115,6 +120,7 @@ object NodePool {
                 _updatedAt.value = root.optLong("updatedAt")
                 val arr = root.optJSONArray("nodes") ?: JSONArray()
                 _nodes.value = (0 until arr.length()).mapNotNull { runCatching { Node.fromJson(arr.getJSONObject(it)) }.getOrNull() }
+                    .map { enrich(it) }
             }
         }
         var loaded: List<Subscription> = emptyList()
@@ -213,9 +219,18 @@ object NodePool {
         val p = e.proxy
         return Node(
             id = p.key, raw = e.raw, name = p.name.take(60), protocol = p.protocol, server = p.server, port = p.port,
-            transport = p.transport, security = p.security, udp = p.udpNative, ccHint = Geo.ccFromText(p.name), source = source
+            transport = p.transport, security = p.security, udp = p.udpNative, ccHint = hintFor(p.name, p.server), source = source
         )
     }
+
+    /** Country guess from the node's label first, then from its host name (nl1.example.com, ams02.host.net ...). */
+    private fun hintFor(name: String, server: String): String =
+        Geo.ccFromText(name).ifEmpty { Geo.ccFromHost(server) }
+
+    /** Fills a missing country hint with the upgraded matcher (also applied to nodes saved by older versions). */
+    private fun enrich(n: Node): Node =
+        if (n.exitCc.isNotEmpty() || n.ccHint.isNotEmpty()) n
+        else hintFor(n.name, n.server).let { if (it.isEmpty()) n else n.copy(ccHint = it) }
 
     private fun mergeIn(fresh: List<Node>): Int {
         synchronized(lock) {
@@ -254,54 +269,93 @@ object NodePool {
 
     // ------------------------------------------------------------------ refresh
 
-    private fun mirrors(url: String): List<String> {
-        val out = arrayListOf(url)
-        Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)$").find(url)?.let {
-            val (u, r, b, p) = it.destructured
-            out.add("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p")
-        }
-        Regex("^https://github\\.com/([^/]+)/([^/]+)/raw/(?:refs/heads/)?([^/]+)/(.+)$").find(url)?.let {
-            val (u, r, b, p) = it.destructured
-            out.add("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p")
+    /** One download source: [delayMs] staggers the start so cheap mirrors are only used when the first ones are slow. */
+    private class Source(val url: String, val delayMs: Long)
+
+    /**
+     * The original URL plus public CDN mirrors of the same GitHub file. On ISPs that throttle github.com /
+     * raw.githubusercontent.com the CDN copies answer instead. They are started staggered (original + first mirror at
+     * once, the rest only if nothing has answered yet) to keep sockets and RAM low on budget phones.
+     */
+    private fun sources(url: String): List<Source> {
+        val out = arrayListOf(Source(url, 0))
+        val m = Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)$").find(url)
+            ?: Regex("^https://github\\.com/([^/]+)/([^/]+)/raw/(?:refs/heads/)?([^/]+)/(.+)$").find(url)
+        if (m != null) {
+            val (u, r, b, p) = m.destructured
+            out.add(Source("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p", 0))
+            out.add(Source("https://fastly.jsdelivr.net/gh/$u/$r@$b/$p", 1_500))
+            out.add(Source("https://gcore.jsdelivr.net/gh/$u/$r@$b/$p", 2_500))
+            out.add(Source("https://cdn.statically.io/gh/$u/$r/$b/$p", 3_500))
+            out.add(Source("https://rawcdn.githack.com/$u/$r/$b/$p", 4_500))
         }
         return out
     }
 
-    private fun download(url: String): String? {
-        for (u in mirrors(url)) {
-            val c = runCatching { URL(u).openConnection() as HttpURLConnection }.getOrNull() ?: continue
-            try {
-                c.connectTimeout = 7000
-                c.readTimeout = 9000
-                c.instanceFollowRedirects = true
-                c.setRequestProperty("User-Agent", "SilentGateVPN/1.1")
-                if (c.responseCode !in 200..299) continue
-                val buf = java.io.ByteArrayOutputStream()
-                c.inputStream.use { ins ->
-                    val chunk = ByteArray(16 * 1024)
-                    while (true) {
-                        val n = ins.read(chunk)
-                        if (n < 0) break
-                        buf.write(chunk, 0, n)
-                        if (buf.size() > MAX_BODY_BYTES) break
-                    }
+    private const val ATTEMPT_TIMEOUT_MS = 4_500
+    private const val DOWNLOAD_TOTAL_MS = 20_000L
+
+    private fun fetchOne(url: String, conns: ConcurrentLinkedQueue<HttpURLConnection>): String? {
+        val c = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return null
+        conns.add(c)
+        return try {
+            c.connectTimeout = ATTEMPT_TIMEOUT_MS
+            c.readTimeout = ATTEMPT_TIMEOUT_MS
+            c.instanceFollowRedirects = true
+            c.setRequestProperty("User-Agent", "SilentGateVPN/1.2")
+            if (c.responseCode !in 200..299) return null
+            val buf = java.io.ByteArrayOutputStream()
+            c.inputStream.use { ins ->
+                val chunk = ByteArray(16 * 1024)
+                while (true) {
+                    val n = ins.read(chunk)
+                    if (n < 0) break
+                    buf.write(chunk, 0, n)
+                    if (buf.size() > MAX_BODY_BYTES) break
                 }
-                return buf.toString(Charsets.UTF_8.name())
-            } catch (_: Exception) {
-            } finally {
-                c.disconnect()
+            }
+            val body = buf.toString(Charsets.UTF_8.name())
+            // A CDN error page or a captive-portal page is not a feed.
+            if (body.length < 40 || body.trimStart().startsWith("<")) null else body
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { c.disconnect() }
+        }
+    }
+
+    /** Races the original URL against its mirrors; the first valid body wins and the losers are cancelled at once. */
+    private suspend fun download(url: String): String? {
+        val list = sources(url)
+        val done = CompletableDeferred<String?>()
+        val left = AtomicInteger(list.size)
+        val conns = ConcurrentLinkedQueue<HttpURLConnection>()
+        val jobs = list.map { src ->
+            // Own scope: a blocking socket is not cancellable, so waiting for it would stall the caller.
+            warmScope.launch {
+                if (src.delayMs > 0) delay(src.delayMs)
+                if (done.isCompleted) { left.decrementAndGet(); return@launch }
+                val body = fetchOne(src.url, conns)
+                if (body != null) done.complete(body)
+                else if (left.decrementAndGet() == 0) done.complete(null)
             }
         }
-        return null
+        return try {
+            withTimeoutOrNull(DOWNLOAD_TOTAL_MS) { done.await() }
+        } finally {
+            jobs.forEach { it.cancel() }
+            conns.forEach { runCatching { it.disconnect() } }
+        }
     }
 
     fun isStale(): Boolean = System.currentTimeMillis() - _updatedAt.value > STALE_MS || _nodes.value.size < 8
 
     /**
      * Fire-and-forget refresh used right after the user accepts the welcome screen (and at app start), so the nodes
-     * are already downloaded and filtered before the first tap on Connect. Safe to call repeatedly: [refresh]
-     * ignores a call while another one is running. It deliberately does NOT measure the home IP: that must only
-     * happen right before the tunnel starts, never in the background (it could be mistaken for the VPN exit IP).
+     * are already downloaded and filtered before the first tap on Connect. Safe to call repeatedly: [refresh] joins
+     * a refresh that is already running instead of starting another one. It deliberately does NOT measure the home
+     * IP: that must only happen right before the tunnel starts, never in the background (it could be mistaken for
+     * the VPN exit IP).
      */
     fun prewarm() {
         warmScope.launch {
@@ -309,47 +363,71 @@ object NodePool {
         }
     }
 
-    /** Downloads every enabled feed (two at a time to stay light on a low-RAM phone) and merges the result. */
+    private val refreshLock = Any()
+    private var inFlight: CompletableDeferred<Int>? = null
+
+    /**
+     * Downloads every enabled feed and merges the result. A caller that arrives while a refresh is already running
+     * (prewarm, then the first tap on Connect) AWAITS that same refresh and gets its real node count, instead of an
+     * immediate empty answer. The work runs in its own scope, so a caller that times out and stops waiting does not
+     * abort the download: the nodes still land in the pool for the next attempt.
+     */
     suspend fun refresh(): Int {
-        if (!_refreshing.compareAndSet(false, true)) return _nodes.value.size
-        try {
-            val active = _subs.value.filter { it.enabled }
-            if (active.isEmpty()) { lastRefreshMessage.value = "No subscriptions enabled"; return _nodes.value.size }
-            val sem = Semaphore(2)
-            val results: List<Pair<Subscription, List<Node>?>> = coroutineScope {
-                active.map { sub ->
-                    async(Dispatchers.IO) {
-                        sem.withPermit {
-                            val body = download(sub.url) ?: return@withPermit sub to null
-                            val entries = SubscriptionParser.parse(body).filter { acceptable(it.proxy) }
-                            val top = entries.map { it to protocolWeight(it.proxy) }
-                                .shuffled().sortedByDescending { it.second }.take(PER_SUB_CAP)
-                            sub to top.map { toNode(it.first, sub.name) }
+        val d = synchronized(refreshLock) { inFlight ?: startRefresh().also { inFlight = it } }
+        return d.await()
+    }
+
+    private fun startRefresh(): CompletableDeferred<Int> {
+        val d = CompletableDeferred<Int>()
+        _refreshing.value = true
+        warmScope.launch {
+            val n = try { doRefresh() } catch (_: Throwable) { _nodes.value.size }
+            synchronized(refreshLock) { inFlight = null }
+            _refreshing.value = false
+            d.complete(n)
+        }
+        return d
+    }
+
+    /** Feeds are merged as each one arrives, so the first fast feed already gives Connect something to work with. */
+    private suspend fun doRefresh(): Int {
+        val active = _subs.value.filter { it.enabled }
+        if (active.isEmpty()) { lastRefreshMessage.value = "No subscriptions enabled"; return _nodes.value.size }
+        val sem = Semaphore(2)
+        val freshLock = Any()
+        val fresh = ArrayList<Node>()
+        val okUrls = HashMap<String, Int>()
+        coroutineScope {
+            active.map { sub ->
+                async(Dispatchers.IO) {
+                    sem.withPermit {
+                        val body = download(sub.url) ?: return@withPermit
+                        val entries = SubscriptionParser.parse(body).filter { acceptable(it.proxy) }
+                        val top = entries.map { it to protocolWeight(it.proxy) }
+                            .shuffled().sortedByDescending { it.second }.take(PER_SUB_CAP)
+                        val nodes = top.map { toNode(it.first, sub.name) }
+                        synchronized(freshLock) {
+                            fresh.addAll(nodes)
+                            okUrls[sub.url] = nodes.size
+                            mergeIn(fresh.toList())
+                            _updatedAt.value = System.currentTimeMillis()
                         }
                     }
-                }.awaitAll()
-            }
-            val fresh = ArrayList<Node>()
-            var ok = 0
-            val now = System.currentTimeMillis()
-            val updatedSubs = _subs.value.map { s ->
-                val r = results.firstOrNull { it.first.url == s.url }?.second
-                if (r != null) { ok++; fresh.addAll(r); s.copy(count = r.size, lastOkAt = now) } else s
-            }
-            _subs.value = updatedSubs
-            saveSubs()
-            if (ok == 0) {
-                lastRefreshMessage.value = "Could not download any subscription"
-                return _nodes.value.size
-            }
-            withContext(Dispatchers.Default) { mergeIn(fresh) }
-            _updatedAt.value = now
-            saveNodes()
-            lastRefreshMessage.value = "Updated: ${_nodes.value.size} nodes from $ok feed(s)"
-            return _nodes.value.size
-        } finally {
-            _refreshing.value = false
+                }
+            }.awaitAll()
         }
+        val now = System.currentTimeMillis()
+        _subs.value = _subs.value.map { s ->
+            okUrls[s.url]?.let { c -> s.copy(count = c, lastOkAt = now) } ?: s
+        }
+        saveSubs()
+        if (okUrls.isEmpty()) {
+            lastRefreshMessage.value = "Could not download any subscription"
+            return _nodes.value.size
+        }
+        saveNodes()
+        lastRefreshMessage.value = "Updated: ${_nodes.value.size} nodes from ${okUrls.size} feed(s)"
+        return _nodes.value.size
     }
 
     // ------------------------------------------------------------------ ranking
@@ -391,7 +469,9 @@ object NodePool {
         // Overloaded: slow in the parallel media test AND failed recently, so give it a 30 minute rest.
         list = list.filter { !(it.mediaMs > SKIP_MEDIA_MS && it.fails >= 1 && now - it.lastFailAt < 30 * 60_000L) }
         val pref = s.preferredCountry
-        if (pref != "AUTO") {
+        if (pref == Geo.OTHER) {
+            list = list.filter { it.cc.isEmpty() }
+        } else if (pref != "AUTO") {
             val matching = list.filter { it.cc == pref }
             val unknown = list.filter { it.cc.isEmpty() }
             list = if (matching.isNotEmpty()) matching + unknown else unknown
@@ -406,6 +486,40 @@ object NodePool {
         for (cc in Geo.SAFE_PRIORITY) counts[cc]?.let { out[cc] = it }
         for ((cc, n) in counts.entries.sortedByDescending { it.value }) if (cc !in out) out[cc] = n
         return out
+    }
+
+    /**
+     * What the location picker shows. [safe] = preferred unrestricted countries, [other] = any other usable country
+     * (including the US, whose exit state is checked after connecting), [ageCheck] = restricted countries, only filled
+     * when "avoid restricted" is off, [unknown] = nodes without a known country ("Global / Other").
+     * The home country is never offered unless the user allowed home exits.
+     */
+    class PickerData(
+        val safe: Map<String, Int>, val other: Map<String, Int>, val ageCheck: Map<String, Int>, val unknown: Int
+    ) {
+        val isEmpty: Boolean get() = safe.isEmpty() && other.isEmpty() && ageCheck.isEmpty() && unknown == 0
+    }
+
+    fun pickerData(s: AppSettings, home: HomeInfo): PickerData {
+        val now = System.currentTimeMillis()
+        val usable = _nodes.value.filter { !(it.fails >= 3 && now - it.lastFailAt < 30 * 60_000L) }
+        val counts = usable.filter { it.cc.isNotEmpty() }.groupingBy { it.cc }.eachCount()
+        val safe = LinkedHashMap<String, Int>()
+        val other = LinkedHashMap<String, Int>()
+        val age = LinkedHashMap<String, Int>()
+        fun place(cc: String, n: Int) {
+            if (!s.allowHomeExit && home.cc.isNotEmpty() && cc.equals(home.cc, true)) return
+            val restricted = cc in Geo.RESTRICTED_COUNTRIES
+            when {
+                restricted && s.avoidRestricted -> Unit
+                restricted -> age[cc] = n
+                cc in Geo.PICKER_COUNTRIES -> safe[cc] = n
+                else -> other[cc] = n
+            }
+        }
+        for (cc in Geo.PICKER_COUNTRIES) counts[cc]?.let { place(cc, it) }
+        for ((cc, n) in counts.entries.sortedByDescending { it.value }) if (cc !in safe) place(cc, n)
+        return PickerData(safe, other, age, usable.count { it.cc.isEmpty() })
     }
 
     fun get(id: String): Node? = _nodes.value.firstOrNull { it.id == id }

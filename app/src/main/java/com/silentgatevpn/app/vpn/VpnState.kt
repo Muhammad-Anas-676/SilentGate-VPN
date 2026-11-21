@@ -38,6 +38,8 @@ object VpnState {
     val sessionTx = MutableStateFlow(0L)
     val alwaysOn = MutableStateFlow(false)
     val lockdown = MutableStateFlow(false)
+    /** Set after Disconnect when Android's Always-on VPN is enabled and may keep or restart the VPN by itself. */
+    val alwaysOnHint = MutableStateFlow(false)
     val log = MutableStateFlow<List<String>>(emptyList())
     val lastFailure = MutableStateFlow<List<String>>(emptyList())
 

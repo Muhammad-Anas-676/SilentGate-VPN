@@ -17,8 +17,8 @@ android {
         applicationId = "com.silentgatevpn.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.2.0"
+        versionCode = 8
+        versionName = "1.2.1"
         buildConfigField("String", "PRIMARY_SERVER", "\"" + sgPrimaryServer.replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
