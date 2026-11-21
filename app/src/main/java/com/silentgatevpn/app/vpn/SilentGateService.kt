@@ -455,7 +455,12 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             while (pending > 0 && tried < maxTried && !ok && System.currentTimeMillis() - t0 < budget) {
                 val left = budget - (System.currentTimeMillis() - t0)
                 if (left <= 0) break
-                val got = withTimeoutOrNull(minOf(if (lowEnd) 15_000L else 18_000L, left)) { ch.receive() } ?: break
+                val got = withTimeoutOrNull(minOf(if (lowEnd) 15_000L else 18_000L, left)) { ch.receive() }
+                if (got == null) {
+                    // A quiet channel is not a failure: keep waiting while probes are pending and budget remains.
+                    delay(300)
+                    continue
+                }
                 pending--
                 val (n, ms) = got
                 if (ms < 0) {
@@ -476,9 +481,9 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             jobs.forEach { it.cancel() }
             ch.close()
         }
-        if (!ok && tried < 2 && slow.isNotEmpty()) {
-            VpnState.log("Only slow nodes answered, trying the least slow ones")
-            for (n in slow.sortedBy { it.latencyMs }.take(2)) {
+        if (!ok && slow.isNotEmpty() && System.currentTimeMillis() - t0 < budget) {
+            VpnState.log("Trying reachable nodes from candidate pool (${slow.size} available)")
+            for (n in slow.sortedBy { it.latencyMs }.take(if (lowEnd) 4 else 2)) {
                 if (System.currentTimeMillis() - t0 > budget) break
                 ok = attemptNode(run, layer, n)
                 if (ok) break
@@ -533,7 +538,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         }
         if (!started) { run.reasons += "$label: ${lastError.take(120)}"; return false }
 
-        val tunnelTimeout = if (SilentGateApp.isLowEndDevice && layer == ConfigBuilder.Layer.NODE) 10_000L else layer.timeoutMs
+        val tunnelTimeout = if (SilentGateApp.isLowEndDevice) maxOf(layer.timeoutMs, 12_000L) else layer.timeoutMs
         var result = Net.waitForTunnel(tunnelTimeout)
         if (result == Net.TunnelResult.DNS_BROKEN && rotateDns) {
             // Tunnel carries traffic but names do not resolve (resolver blocked): rotate DNS provider, resolvers that
@@ -779,7 +784,16 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         options.getInet6Address().let { while (it.hasNext()) { val p = it.next(); b.addAddress(p.address(), p.prefix()); has6 = true } }
 
         if (options.getAutoRoute()) {
-            options.getDNSServerAddress().let { if (it.hasNext()) b.addDnsServer(it.next()) }
+            var dnsCount = 0
+            options.getDNSServerAddress().let {
+                while (it.hasNext()) { b.addDnsServer(it.next()); dnsCount++ }
+            }
+            if (dnsCount == 0) {
+                // libbox gave no resolver: never leave the VPN interface without one.
+                b.addDnsServer("172.19.0.2")
+                b.addDnsServer("1.1.1.1")
+                b.addDnsServer("8.8.8.8")
+            }
 
             var any4 = false
             options.getInet4RouteAddress().let { while (it.hasNext()) { val p = it.next(); b.addRoute(p.address(), p.prefix()); any4 = true } }

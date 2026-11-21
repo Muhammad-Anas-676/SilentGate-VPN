@@ -29,7 +29,11 @@ object Prober {
     const val THROTTLED = -2L
 
     /** A single handshake slower than this marks the node as overloaded (it is tried last, not first). */
-    const val SLOW_MS = 1_800L
+    private const val SLOW_MS_NORMAL = 1_800L
+    private const val SLOW_MS_LOW_END = 3_200L
+
+    /** Entry-level MediaTek CPUs need 1.5 to 2.5 s for a Conscrypt TLS handshake, so the limit is higher there. */
+    val SLOW_MS: Long get() = if (SilentGateApp.isLowEndDevice) SLOW_MS_LOW_END else SLOW_MS_NORMAL
 
     private const val BURST_EXTRA = 4      // parallel handshakes after the first one succeeded
     private const val BURST_MIN_OK = 3     // of BURST_EXTRA

@@ -152,10 +152,9 @@ object ConfigBuilder {
             "address" to arr("172.19.0.1/30", "fdfe:dcba:9876::1/126"),
             "mtu" to tunMtu(s, layer, proxy, ctx.underlyingMtu),
             "auto_route" to true,
-            // Android 7.0 to 8.1 (API < 29): strict_route would force ~30 fragmented split CIDR routes through netd.
-            // auto_detect_interface + protect(fd) already keep the core's own sockets out of the tunnel, so clean
-            // 0.0.0.0/0 routing is used there.
-            "strict_route" to (Build.VERSION.SDK_INT >= 29),
+            // strict_route is ALWAYS on (API 24+). With it off, libbox hands openTun() an EMPTY DNS server list, the
+            // VpnService interface ends up with no resolver and every in-tunnel probe dies with "no traffic".
+            "strict_route" to true,
             // "mixed" is proven to pass VLESS traffic on Android 7 to 8 (SilentGateApp enables fixAndroidStack for
             // API 24..28). Pure gVisor is only a fallback, reached when variant 0 was rejected by the core.
             "stack" to if (variant >= 1 && Build.VERSION.SDK_INT < 29) "gvisor" else "mixed"
