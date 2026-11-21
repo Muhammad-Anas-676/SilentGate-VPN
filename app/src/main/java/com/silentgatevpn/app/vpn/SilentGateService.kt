@@ -95,6 +95,8 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
     private var server: CommandServer? = null
     private var currentLayer: ConfigBuilder.Layer? = null
     private var currentNodeId: String? = null
+    /** The free Shadowsocks server currently in use (Shadowsocks engine), so failover can skip it. */
+    @Volatile private var currentSsId: String? = null
     private val failedNodes = HashSet<String>()
     @Volatile private var lastNetChange = 0L
     private var lastIfaceName = ""
@@ -333,6 +335,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         VpnState.status.value = Status.CONNECTING
         VpnState.lastFailure.value = emptyList()
         VpnState.resetSession()
+        currentSsId = null
         val saved = SettingsStore.value
         try {
             if (server == null) {
@@ -391,11 +394,40 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         return false
     }
 
-    /** Shadowsocks engine: the user's own ss:// server. A personal server is not held to the community-node media test. */
+    /**
+     * Shadowsocks engine. 1) the user's own ss:// server if one is saved, 2) free open-source Shadowsocks servers,
+     * Netherlands first. The first pass runs the full quality checks, the second only checks that the IP changed,
+     * so a working but modest free server is still accepted instead of ending in "could not connect".
+     */
     private suspend fun tryShadowsocks(run: Run): Boolean {
-        val proxy = ShadowsocksServer.proxy()
-        if (proxy == null) { run.reasons += "Shadowsocks: no server added on Home"; return false }
-        return attempt(run, ConfigBuilder.Layer.SHADOWSOCKS, proxy, null, "Shadowsocks", enforce = false, rotateDns = true)
+        ShadowsocksServer.proxy()?.let { own ->
+            if (attempt(run, ConfigBuilder.Layer.SHADOWSOCKS, own, null, "My Shadowsocks server", enforce = false, rotateDns = true)) return true
+        }
+        VpnState.message.value = "Finding a free Shadowsocks server…"
+        updateNotification("Finding a free server…")
+        var cands = SsNodePool.candidates(run.s, run.home, failedNodes)
+        if (cands.size < 8 || SsNodePool.isStale()) {
+            val wait = if (SsNodePool.nodes.value.isEmpty()) 35_000L else 18_000L
+            withTimeoutOrNull(wait) { SsNodePool.refresh() }
+            cands = SsNodePool.candidates(run.s, run.home, failedNodes)
+        }
+        if (cands.isEmpty()) { run.reasons += "Free Shadowsocks: no servers available (check your internet)"; return false }
+        val strict = cands.take(6)
+        val relaxed = cands.drop(6).take(8)
+        for ((i, n) in (strict + relaxed).withIndex()) {
+            val label = (if (n.cc.isNotEmpty()) Geo.flag(n.cc) + " " else "") + "Free server ${i + 1}"
+            val proxy = runCatching { ProxyParser.parseAny(n.raw) }.getOrNull()
+            if (proxy == null) { SsNodePool.markFail(n.id); failedNodes.add(n.id); continue }
+            val ok = attempt(run, ConfigBuilder.Layer.SHADOWSOCKS, proxy, null, label, enforce = i < strict.size, rotateDns = true)
+            if (ok) {
+                currentSsId = n.id
+                SsNodePool.markOk(n.id, VpnState.nodeCc.value, VpnState.exit.value?.pingMs ?: -1L)
+                return true
+            }
+            SsNodePool.markFail(n.id); failedNodes.add(n.id)
+        }
+        run.reasons += "Free Shadowsocks: none of the ${strict.size + relaxed.size} servers tried could connect"
+        return false
     }
 
     private suspend fun tryOwnServer(run: Run): Boolean {
@@ -688,9 +720,9 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                     val healthy = busy || (h.ok >= Net.healthMinOk && (SilentGateApp.isLowEndDevice || h.medianMs <= 4_500))
                     failures = if (healthy) 0 else failures + 1
                     if (failures >= (if (recentChange || stalled) 2 else 3) && canFailover) {
-                        val bad = currentNodeId
+                        val bad = currentNodeId ?: currentSsId
                         VpnState.log("Tunnel degraded on ${layer.title} (${h.ok}/${h.total} hosts, ${h.medianMs} ms); failing over")
-                        if (bad != null) NodePool.markFail(bad)
+                        if (bad != null) { NodePool.markFail(bad); SsNodePool.markFail(bad) }
                         connectJob = scope.launch { if (!stopping) connectFlow(avoidNodeId = bad, skipLayer = if (bad == null) layer else null) }
                         return@launch
                     }

@@ -63,6 +63,7 @@ import com.silentgatevpn.app.R
 import com.silentgatevpn.app.vpn.ConnectMode
 import com.silentgatevpn.app.vpn.Engine
 import com.silentgatevpn.app.vpn.ShadowsocksServer
+import com.silentgatevpn.app.vpn.SsNodePool
 import com.silentgatevpn.app.vpn.Geo
 import com.silentgatevpn.app.vpn.Net
 import com.silentgatevpn.app.vpn.NodePool
@@ -93,7 +94,8 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
     val context = LocalContext.current
     var showPicker by remember { mutableStateOf(false) }
     val ssSummary by ShadowsocksServer.summary.collectAsState()
-    var ssHint by remember { mutableStateOf(false) }
+    val ssPoolBusy by SsNodePool.refreshing.collectAsState()
+    val ssPoolNodes by SsNodePool.nodes.collectAsState()
     val ssEngine = settings.engine == Engine.SHADOWSOCKS
 
     val connected = status == Status.CONNECTED
@@ -107,6 +109,11 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
         if (pc != "AUTO" && pc != Geo.OTHER &&
             Geo.excludedReason(pc, "", Net.home.cc, settings.avoidRestricted, settings.allowHomeExit) != null
         ) SettingsStore.update { it.copy(preferredCountry = "AUTO") }
+    }
+
+    // Selecting Shadowsocks starts downloading the free server lists right away, so the first tap on Connect is fast.
+    LaunchedEffect(ssEngine) {
+        if (ssEngine && SsNodePool.isStale() && !SsNodePool.refreshing.value) runCatching { SsNodePool.refresh() }
     }
 
     // Opening the picker with no servers loaded yet starts a download in the background.
@@ -129,7 +136,6 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
 
         Spacer(Modifier.height(16.dp))
         EngineSelector(settings.engine, enabled = idle) { e ->
-            ssHint = false
             SettingsStore.update { it.copy(engine = e) }
         }
 
@@ -137,12 +143,7 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
         ConnectButton(status = status, warn = warn, onClick = {
             when (status) {
                 Status.DISCONNECTED, Status.ERROR ->
-                    if (ssEngine && ssSummary == null) {
-                        ssHint = true
-                    } else {
-                        ssHint = false
-                        onConnect()
-                    }
+                    onConnect()
                 Status.CONNECTED, Status.CONNECTING -> onDisconnect()
                 Status.DISCONNECTING -> Unit
             }
@@ -168,8 +169,8 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
         )
         Text(
             when (status) {
-                Status.DISCONNECTED -> if (ssEngine) "Tap the button to connect to your server" else "Tap the button to connect"
-                Status.CONNECTING -> if (ssEngine) "Connecting to your Shadowsocks server…" else "Finding the fastest server…"
+                Status.DISCONNECTED -> if (ssEngine) "Tap the button to connect with free servers" else "Tap the button to connect"
+                Status.CONNECTING -> if (ssEngine) "Finding a working Shadowsocks server…" else "Finding the fastest server…"
                 Status.CONNECTED -> "Your connection is private"
                 Status.DISCONNECTING -> ""
                 Status.ERROR -> "Check your internet and try again"
@@ -220,7 +221,7 @@ fun HomeScreen(onConnect: () -> Unit, onDisconnect: () -> Unit) {
 
         Spacer(Modifier.height(24.dp))
         if (ssEngine) {
-            ShadowsocksCard(ssSummary, idle, showHint = ssHint, onSaved = { ssHint = false })
+            ShadowsocksCard(ssSummary, idle, freeCount = ssPoolNodes.size, poolBusy = ssPoolBusy)
             if (connected && connectedCc.isNotEmpty()) {
                 Text(
                     "Connected: ${Geo.flag(connectedCc)} ${Geo.name(connectedCc)}",
@@ -331,26 +332,39 @@ private fun EngineSelector(selected: Engine, enabled: Boolean, onSelect: (Engine
 }
 
 @Composable
-private fun ShadowsocksCard(summary: String?, idle: Boolean, showHint: Boolean, onSaved: () -> Unit) {
+private fun ShadowsocksCard(summary: String?, idle: Boolean, freeCount: Int, poolBusy: Boolean) {
     val clipboard = LocalClipboardManager.current
-    var editing by remember(summary) { mutableStateOf(summary == null) }
+    var editing by remember(summary) { mutableStateOf(false) }
     var text by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
-    SgCardBox(border = if (showHint && summary == null) SgOrange else MaterialTheme.colorScheme.outlineVariant) {
-        Text("Shadowsocks server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    SgCardBox {
+        Text("Free Shadowsocks servers", style = MaterialTheme.typography.titleMedium)
+        Text(
+            when {
+                poolBusy && freeCount == 0 -> "Downloading free open-source servers…"
+                poolBusy -> "Updating servers… $freeCount ready"
+                freeCount > 0 -> "$freeCount free servers ready · Netherlands first, then nearby Europe"
+                else -> "Servers are downloaded when you tap Connect"
+            },
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            "Free public servers can be slow or change often. Avoid banking and important logins on them.",
+            style = MaterialTheme.typography.bodySmall, color = SgOrange, modifier = Modifier.padding(top = 6.dp)
+        )
         if (summary != null && !editing) {
-            Text(summary, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 2.dp))
+            Text("My server (tried first)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 12.dp))
+            Text(summary, style = MaterialTheme.typography.titleSmall)
             Row {
                 TextButton(enabled = idle, onClick = { editing = true }) { Text("Change", color = if (idle) SgGreen else SgTextDim) }
                 TextButton(enabled = idle, onClick = { ShadowsocksServer.clear() }) { Text("Remove", color = if (idle) SgOrange else SgTextDim) }
             }
-        } else {
+        } else if (editing) {
             Text(
-                if (showHint && summary == null) "Add your ss:// link first, then tap the power button."
-                else "Paste your ss:// link. It is saved encrypted on this phone.",
-                style = MaterialTheme.typography.bodySmall,
-                color = if (showHint && summary == null) SgOrange else MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 2.dp)
+                "Optional: paste your own ss:// link. It is saved encrypted on this phone and tried before the free servers.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 12.dp)
             )
             OutlinedTextField(
                 value = text, onValueChange = { text = it; error = null }, minLines = 2, maxLines = 4,
@@ -372,9 +386,13 @@ private fun ShadowsocksCard(summary: String?, idle: Boolean, showHint: Boolean, 
                 }
                 TextButton(enabled = idle && text.isNotBlank(), onClick = {
                     val e = ShadowsocksServer.set(text)
-                    if (e == null) { text = ""; error = null; editing = false; onSaved() } else error = e
+                    if (e == null) { text = ""; error = null; editing = false } else error = e
                 }) { Text("Save", color = if (idle && text.isNotBlank()) SgGreen else SgTextDim) }
-                if (summary != null) TextButton(onClick = { editing = false; text = ""; error = null }) { Text("Cancel", color = SgTextDim) }
+                TextButton(onClick = { editing = false; text = ""; error = null }) { Text("Cancel", color = SgTextDim) }
+            }
+        } else {
+            TextButton(enabled = idle, onClick = { editing = true }) {
+                Text("Use my own server (optional)", color = if (idle) SgGreen else SgTextDim)
             }
         }
     }

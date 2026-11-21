@@ -9,6 +9,7 @@ import com.silentgatevpn.app.vpn.Net
 import com.silentgatevpn.app.vpn.NodePool
 import com.silentgatevpn.app.vpn.PrimaryServer
 import com.silentgatevpn.app.vpn.ShadowsocksServer
+import com.silentgatevpn.app.vpn.SsNodePool
 import com.silentgatevpn.app.vpn.ProfileStore
 import com.silentgatevpn.app.vpn.SettingsStore
 import com.silentgatevpn.app.vpn.VpnState
@@ -52,6 +53,7 @@ class SilentGateApp : Application() {
         PrimaryServer.init(this)
         ShadowsocksServer.init(this)
         NodePool.init(File(filesDir, "pool").apply { mkdirs() })
+        SsNodePool.init(File(filesDir, "pool").apply { mkdirs() })
         // Last-resort home country if the live check fails: the SIM / network country, then Pakistan.
         runCatching {
             val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager

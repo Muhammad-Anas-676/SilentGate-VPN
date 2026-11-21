@@ -21,7 +21,7 @@ enum class ConnectMode(val label: String, val hint: String) {
 /** The two engines offered on Home: the existing Smart Auto flow (default) or your own Shadowsocks server. */
 enum class Engine(val label: String, val hint: String) {
     DEFAULT("Smart Auto", "Default · private server, nodes, WARP"),
-    SHADOWSOCKS("Shadowsocks", "Your own ss:// server · light")
+    SHADOWSOCKS("Shadowsocks", "Free servers · light")
 }
 
 enum class QuicMode(val label: String) { AUTO("Smart"), BLOCK("Block QUIC"), ALLOW("Allow QUIC") }

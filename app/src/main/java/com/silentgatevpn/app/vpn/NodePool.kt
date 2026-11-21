@@ -231,7 +231,7 @@ object NodePool {
     }
 
     /** Country guess from the node's label first, then from its host name (nl1.example.com, ams02.host.net ...). */
-    private fun hintFor(name: String, server: String): String =
+    internal fun hintFor(name: String, server: String): String =
         Geo.ccFromText(name).ifEmpty { Geo.ccFromHost(server) }
 
     /** Fills a missing country hint with the upgraded matcher (also applied to nodes saved by older versions). */
@@ -407,7 +407,7 @@ object NodePool {
     }
 
     /** Races the original URL against its mirrors; the first valid body wins and the losers are cancelled at once. */
-    private suspend fun download(url: String): String? {
+    internal suspend fun download(url: String): String? {
         val list = sources(url)
         val done = CompletableDeferred<String?>()
         val left = AtomicInteger(list.size)
