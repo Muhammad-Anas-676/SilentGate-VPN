@@ -1,6 +1,7 @@
 package com.silentgatevpn.app.vpn
 
 import com.silentgatevpn.app.SilentGateApp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -111,16 +112,62 @@ object Net {
         }.getOrDefault(-1L)
     }
 
-    suspend fun cfTrace(timeoutMs: Int = 8000): Trace {
-        val t0 = System.currentTimeMillis()
-        val body = http("https://1.1.1.1/cdn-cgi/trace", timeoutMs)
-        val rtt = System.currentTimeMillis() - t0
+    /** Parses Cloudflare's key=value `/cdn-cgi/trace` body; null when it carries no IP (captive page, error text). */
+    private fun parseCfTraceBody(body: String, rtt: Long): Trace? {
         val map = body.lineSequence().mapNotNull {
             val i = it.indexOf('=')
-            if (i > 0) it.substring(0, i) to it.substring(i + 1) else null
+            if (i > 0) it.substring(0, i).trim() to it.substring(i + 1).trim() else null
         }.toMap()
-        val ip = map["ip"] ?: error("no ip in trace")
-        return Trace(ip, map["loc"] ?: "", map["colo"] ?: "", (map["warp"] ?: "off") != "off", rtt)
+        val ip = map["ip"].orEmpty()
+        if (ip.isEmpty()) return null
+        return Trace(ip, map["loc"].orEmpty().uppercase(), map["colo"].orEmpty(), (map["warp"] ?: "off") != "off", rtt)
+    }
+
+    /** Parses the JSON of ipwho.is / ipapi.co (`ip` + `country_code`); null on an error reply or a missing IP. */
+    private fun parseGeoJsonBody(body: String, rtt: Long): Trace? {
+        val j = JSONObject(body)
+        if (!j.optBoolean("success", true) || j.optBoolean("error", false)) return null
+        val ip = j.optString("ip").trim()
+        if (ip.isEmpty()) return null
+        var cc = j.optString("country_code").trim()
+        if (cc.isEmpty()) cc = j.optString("country").trim().takeIf { it.length == 2 }.orEmpty()
+        return Trace(ip = ip, loc = cc.uppercase(), colo = "", warp = false, rttMs = rtt)
+    }
+
+    /** One trace endpoint. The round trip is measured for this request alone, so earlier failures never inflate it. */
+    private suspend fun traceAttempt(url: String, timeoutMs: Int, geoJson: Boolean): Trace? {
+        val t0 = System.currentTimeMillis()
+        return try {
+            val body = http(url, timeoutMs)
+            val rtt = System.currentTimeMillis() - t0
+            if (geoJson) parseGeoJsonBody(body, rtt) else parseCfTraceBody(body, rtt)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Exit IP + country with a fallback chain, so one unreachable endpoint never rejects a working tunnel:
+     * 1.1.1.1 (IP literal, no DNS) -> www.cloudflare.com (needs the modern roots / DNS, not 1.1.1.1) -> ipwho.is ->
+     * ipapi.co. [timeoutMs] is the budget for the whole chain; each attempt gets a share of what is left, so a fast
+     * failure (TLS error on old Android) costs almost nothing and a silent drop cannot eat the whole budget.
+     */
+    suspend fun cfTrace(timeoutMs: Int = 8000): Trace {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val chain = listOf(
+            Triple("https://1.1.1.1/cdn-cgi/trace", false, 0.40),
+            Triple("https://www.cloudflare.com/cdn-cgi/trace", false, 0.50),
+            Triple("https://ipwho.is/", true, 0.70),
+            Triple("https://ipapi.co/json/", true, 1.00)
+        )
+        for ((url, geoJson, share) in chain) {
+            val left = deadline - System.currentTimeMillis()
+            if (left < 600) break
+            traceAttempt(url, (left * share).toInt().coerceAtLeast(600), geoJson)?.let { return it }
+        }
+        error("no location answer from any trace endpoint")
     }
 
     // ------------------------------------------------------------------ home (ISP side) info

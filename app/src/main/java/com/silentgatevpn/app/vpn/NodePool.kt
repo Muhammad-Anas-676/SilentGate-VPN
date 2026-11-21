@@ -299,8 +299,10 @@ object NodePool {
         return out
     }
 
-    private const val ATTEMPT_TIMEOUT_MS = 4_500
-    private const val DOWNLOAD_TOTAL_MS = 20_000L
+    /** Fail fast on dead mirrors, but let a live one finish a large feed: connect and read are separate limits. */
+    private const val CONNECT_TIMEOUT_MS = 4_500
+    private val READ_TIMEOUT_MS: Int get() = if (SilentGateApp.isLowEndDevice) 12_000 else 10_000
+    private const val DOWNLOAD_TOTAL_MS = 25_000L
 
     private const val MAX_REDIRECTS = 5
 
@@ -352,8 +354,8 @@ object NodePool {
 
     /** Reads one response. [base] is the URL the caller asked for (redirects are resolved against it, not the IP). */
     private fun readHop(c: HttpURLConnection, base: URL): Hop = try {
-        c.connectTimeout = ATTEMPT_TIMEOUT_MS
-        c.readTimeout = ATTEMPT_TIMEOUT_MS
+        c.connectTimeout = CONNECT_TIMEOUT_MS
+        c.readTimeout = READ_TIMEOUT_MS
         c.instanceFollowRedirects = false
         c.setRequestProperty("User-Agent", "SilentGateVPN/1.2")
         val code = c.responseCode
