@@ -3,6 +3,8 @@ package com.silentgatevpn.app.vpn
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import android.util.Base64
+import com.silentgatevpn.app.SilentGateApp
 
 /** One proxy server, parsed from a share link, a Clash/sing-box entry or raw sing-box JSON. */
 class ParsedProxy(
@@ -74,8 +76,24 @@ private class Opt(
 object B64 {
     private const val TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
-    /** Tolerant decoder: standard or URL-safe alphabet, with or without padding, whitespace ignored. */
+    /**
+     * Tolerant decoder: standard or URL-safe alphabet, with or without padding, whitespace ignored.
+     * Uses the native android.util.Base64 (milliseconds for a 500 KB feed on a 1.3 GHz CPU); the byte-by-byte loop
+     * below is only the fallback for input the native decoder rejects.
+     */
     fun decode(input: String): ByteArray? {
+        val t = input.trim().replace('-', '+').replace('_', '/').trimEnd('=')
+        if (t.isEmpty()) return ByteArray(0)
+        try {
+            // DEFAULT skips embedded whitespace / line breaks and accepts missing padding.
+            return Base64.decode(t, Base64.DEFAULT)
+        } catch (_: RuntimeException) {
+            // IllegalArgumentException (bad character) or a non-Android runtime: fall through to the safe slow path.
+        }
+        return decodeSlow(input)
+    }
+
+    private fun decodeSlow(input: String): ByteArray? {
         val s = input.filter { !it.isWhitespace() }.replace('-', '+').replace('_', '/').trimEnd('=')
         if (s.isEmpty()) return ByteArray(0)
         val out = ByteArrayOutputStream(s.length * 3 / 4 + 3)
@@ -667,6 +685,9 @@ object SubscriptionParser {
 
     private const val MAX_LINES = 8000
 
+    /** Budget phones keep only a few hundred nodes anyway (NodePool PER_SUB_CAP), so parsing stops early there. */
+    private const val LOW_END_MAX_ENTRIES = 350
+
     fun parse(body: String): List<Entry> {
         val t = body.trim().removePrefix("\uFEFF")
         if (t.isEmpty()) return emptyList()
@@ -675,12 +696,14 @@ object SubscriptionParser {
         val text = if (t.contains("://")) t else (B64.decodeToString(t) ?: t)
         if (text.trimStart().startsWith("{")) return fromSingboxJson(text.trim())
         val out = ArrayList<Entry>()
+        val maxEntries = if (SilentGateApp.isLowEndDevice) LOW_END_MAX_ENTRIES else Int.MAX_VALUE
         var n = 0
         for (line in text.lineSequence()) {
             if (++n > MAX_LINES) break
             val l = line.trim()
             if (l.isEmpty() || !ProxyParser.looksLikeLink(l)) continue
             runCatching { ProxyParser.parseLink(l) }.onSuccess { out.add(Entry(l, it)) }
+            if (out.size >= maxEntries) break
         }
         return out
     }

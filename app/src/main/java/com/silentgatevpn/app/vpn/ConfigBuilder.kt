@@ -152,10 +152,13 @@ object ConfigBuilder {
             "address" to arr("172.19.0.1/30", "fdfe:dcba:9876::1/126"),
             "mtu" to tunMtu(s, layer, proxy, ctx.underlyingMtu),
             "auto_route" to true,
-            "strict_route" to true,
-            // Android 7.0 to 9 kernels (MediaTek budget phones especially) stall with the native "system" TCP path that
-            // "mixed" uses; the pure userspace gVisor stack is reliable there.
-            "stack" to if (Build.VERSION.SDK_INT < 29) "gvisor" else "mixed"
+            // Android 7.0 to 8.1 (API < 29): strict_route would force ~30 fragmented split CIDR routes through netd.
+            // auto_detect_interface + protect(fd) already keep the core's own sockets out of the tunnel, so clean
+            // 0.0.0.0/0 routing is used there.
+            "strict_route" to (Build.VERSION.SDK_INT >= 29),
+            // "mixed" is proven to pass VLESS traffic on Android 7 to 8 (SilentGateApp enables fixAndroidStack for
+            // API 24..28). Pure gVisor is only a fallback, reached when variant 0 was rejected by the core.
+            "stack" to if (variant >= 1 && Build.VERSION.SDK_INT < 29) "gvisor" else "mixed"
         )
         if (s.splitPackages.isNotEmpty()) {
             when (s.splitMode) {

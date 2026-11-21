@@ -406,8 +406,8 @@ object Net {
         delay(500)
         var dnsOnly = 0
         while (System.currentTimeMillis() < end) {
-            if (probe(if (lowEnd) 6500 else 4000)) return TunnelResult.OK
-            if (anyOk(IP_PROBES, if (lowEnd) 5000 else 3500)) { if (++dnsOnly >= 2) return TunnelResult.DNS_BROKEN } else dnsOnly = 0
+            if (probe(if (lowEnd) 5500 else 4000)) return TunnelResult.OK
+            if (anyOk(IP_PROBES, if (lowEnd) 4500 else 3500)) { if (++dnsOnly >= 2) return TunnelResult.DNS_BROKEN } else dnsOnly = 0
             delay(600)
         }
         return TunnelResult.NO_TRAFFIC

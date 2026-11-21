@@ -292,16 +292,19 @@ object NodePool {
             val (u, r, b, p) = m.destructured
             out.add(Source("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p", 0))
             out.add(Source("https://fastly.jsdelivr.net/gh/$u/$r@$b/$p", 1_500))
-            out.add(Source("https://gcore.jsdelivr.net/gh/$u/$r@$b/$p", 2_500))
-            out.add(Source("https://cdn.statically.io/gh/$u/$r/$b/$p", 3_500))
-            out.add(Source("https://rawcdn.githack.com/$u/$r/$b/$p", 4_500))
+            // Budget phones: only the 3 fastest sources (original + 2 jsDelivr) to avoid socket / CPU contention.
+            if (!SilentGateApp.isLowEndDevice) {
+                out.add(Source("https://gcore.jsdelivr.net/gh/$u/$r@$b/$p", 2_500))
+                out.add(Source("https://cdn.statically.io/gh/$u/$r/$b/$p", 3_500))
+                out.add(Source("https://rawcdn.githack.com/$u/$r/$b/$p", 4_500))
+            }
         }
         return out
     }
 
     /** Fail fast on dead mirrors, but let a live one finish a large feed: connect and read are separate limits. */
-    private const val CONNECT_TIMEOUT_MS = 4_500
-    private val READ_TIMEOUT_MS: Int get() = if (SilentGateApp.isLowEndDevice) 12_000 else 10_000
+    private const val CONNECT_TIMEOUT_MS = 4_000
+    private const val READ_TIMEOUT_MS = 10_000
     private const val DOWNLOAD_TOTAL_MS = 25_000L
 
     private const val MAX_REDIRECTS = 5
@@ -472,7 +475,9 @@ object NodePool {
     private suspend fun doRefresh(): Int {
         val active = _subs.value.filter { it.enabled }
         if (active.isEmpty()) { lastRefreshMessage.value = "No subscriptions enabled"; return _nodes.value.size }
-        val sem = Semaphore(2)
+        // Budget phones download one feed at a time so the health-checked feed finishes first, without CPU / socket
+        // contention, and the later feeds then complete too instead of timing out.
+        val sem = Semaphore(if (SilentGateApp.isLowEndDevice) 1 else 2)
         val freshLock = Any()
         val fresh = ArrayList<Node>()
         val okUrls = HashMap<String, Int>()

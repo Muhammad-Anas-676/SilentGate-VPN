@@ -401,7 +401,10 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             updateNotification("Fetching nodes…")
             // An empty pool gets longer (slow GitHub / CDN on this ISP). refresh() joins a prewarm that is already
             // running; we go on as soon as the first feed has delivered enough candidates.
-            val wait = if (NodePool.nodes.value.isEmpty()) 25_000L else 14_000L
+            val coldStart = NodePool.nodes.value.isEmpty()
+            val wait = if (coldStart) 30_000L else 14_000L
+            // Cold start: go on as soon as the first (health-checked) feed has delivered 12 candidates.
+            val enough = if (coldStart) 12 else 20
             // Do not stop at the first few raw nodes: an unvetted feed can deliver 6 dead IPs before the health-checked
             // feed arrives, so wait for a bigger pool.
             withTimeoutOrNull(wait) {
@@ -409,7 +412,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
                     val r = async { NodePool.refresh() }
                     while (r.isActive) {
                         delay(400)
-                        if (NodePool.candidates(s, run.home, failedNodes).size >= 20) { r.cancel(); break }
+                        if (NodePool.candidates(s, run.home, failedNodes).size >= enough) { r.cancel(); break }
                     }
                 }
             }
@@ -425,8 +428,8 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         }
         val t0 = System.currentTimeMillis()
         val lowEnd = SilentGateApp.isLowEndDevice
-        val budget = if (lowEnd) 75_000L else 60_000L
-        val maxTried = if (lowEnd) 10 else 6
+        val budget = if (lowEnd) 65_000L else 60_000L
+        val maxTried = if (lowEnd) 8 else 6
         val now = System.currentTimeMillis()
 
         // Fast path: nodes that worked recently are tried first, without any pre-flight, so reconnects are quick.
@@ -452,7 +455,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             while (pending > 0 && tried < maxTried && !ok && System.currentTimeMillis() - t0 < budget) {
                 val left = budget - (System.currentTimeMillis() - t0)
                 if (left <= 0) break
-                val got = withTimeoutOrNull(minOf(18_000L, left)) { ch.receive() } ?: break
+                val got = withTimeoutOrNull(minOf(if (lowEnd) 15_000L else 18_000L, left)) { ch.receive() } ?: break
                 pending--
                 val (n, ms) = got
                 if (ms < 0) {
@@ -530,7 +533,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         }
         if (!started) { run.reasons += "$label: ${lastError.take(120)}"; return false }
 
-        val tunnelTimeout = if (SilentGateApp.isLowEndDevice && layer == ConfigBuilder.Layer.NODE) 14_000L else layer.timeoutMs
+        val tunnelTimeout = if (SilentGateApp.isLowEndDevice && layer == ConfigBuilder.Layer.NODE) 10_000L else layer.timeoutMs
         var result = Net.waitForTunnel(tunnelTimeout)
         if (result == Net.TunnelResult.DNS_BROKEN && rotateDns) {
             // Tunnel carries traffic but names do not resolve (resolver blocked): rotate DNS provider, resolvers that
