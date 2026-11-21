@@ -10,7 +10,7 @@ object ConfigBuilder {
     /** [masksIp] decides whether the app may ever show "Protected" for this layer. */
     enum class Layer(val title: String, val timeoutMs: Long, val masksIp: Boolean) {
         PRIMARY("Private server", 12_000, true),
-        NODE("Smart Node", 7_000, true),
+        NODE("Smart Node", 9_500, true),
         MY_SERVER("My server", 15_000, true),
         WARP("Obfuscated WARP", 30_000, true),
         WARP_NODE("WARP via Node", 25_000, true),

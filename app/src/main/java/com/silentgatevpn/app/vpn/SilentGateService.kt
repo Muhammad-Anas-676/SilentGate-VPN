@@ -402,12 +402,14 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             // An empty pool gets longer (slow GitHub / CDN on this ISP). refresh() joins a prewarm that is already
             // running; we go on as soon as the first feed has delivered enough candidates.
             val wait = if (NodePool.nodes.value.isEmpty()) 25_000L else 14_000L
+            // Do not stop at the first few raw nodes: an unvetted feed can deliver 6 dead IPs before the health-checked
+            // feed arrives, so wait for a bigger pool.
             withTimeoutOrNull(wait) {
                 coroutineScope {
                     val r = async { NodePool.refresh() }
                     while (r.isActive) {
                         delay(400)
-                        if (NodePool.candidates(s, run.home, failedNodes).size >= 6) { r.cancel(); break }
+                        if (NodePool.candidates(s, run.home, failedNodes).size >= 20) { r.cancel(); break }
                     }
                 }
             }
@@ -422,7 +424,9 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
             return false
         }
         val t0 = System.currentTimeMillis()
-        val budget = 50_000L
+        val lowEnd = SilentGateApp.isLowEndDevice
+        val budget = if (lowEnd) 75_000L else 60_000L
+        val maxTried = if (lowEnd) 10 else 6
         val now = System.currentTimeMillis()
 
         // Fast path: nodes that worked recently are tried first, without any pre-flight, so reconnects are quick.
@@ -435,7 +439,7 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
 
         // Others: pre-flight in parallel and connect in order of arrival. Budget-phone caps: at most 6 nodes probed at
         // once (nodeSem) and at most 6 sockets open at once across all of them (gate), whatever the burst size.
-        val rest = cands.filter { c -> fast.none { it.id == c.id } }.take(14)
+        val rest = cands.filter { c -> fast.none { it.id == c.id } }.take(if (lowEnd) 24 else 14)
         val ch = Channel<Pair<Node, Long>>(Channel.UNLIMITED)
         val nodeSem = Semaphore(6)
         val gate = Semaphore(6)
@@ -445,8 +449,10 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         var ok = false
         val slow = ArrayList<Node>()
         try {
-            while (pending > 0 && tried < 6 && !ok && System.currentTimeMillis() - t0 < budget) {
-                val got = withTimeoutOrNull(9_000) { ch.receive() } ?: break
+            while (pending > 0 && tried < maxTried && !ok && System.currentTimeMillis() - t0 < budget) {
+                val left = budget - (System.currentTimeMillis() - t0)
+                if (left <= 0) break
+                val got = withTimeoutOrNull(minOf(18_000L, left)) { ch.receive() } ?: break
                 pending--
                 val (n, ms) = got
                 if (ms < 0) {
@@ -524,7 +530,8 @@ class SilentGateService : VpnService(), PlatformInterface, CommandServerHandler 
         }
         if (!started) { run.reasons += "$label: ${lastError.take(120)}"; return false }
 
-        var result = Net.waitForTunnel(layer.timeoutMs)
+        val tunnelTimeout = if (SilentGateApp.isLowEndDevice && layer == ConfigBuilder.Layer.NODE) 14_000L else layer.timeoutMs
+        var result = Net.waitForTunnel(tunnelTimeout)
         if (result == Net.TunnelResult.DNS_BROKEN && rotateDns) {
             // Tunnel carries traffic but names do not resolve (resolver blocked): rotate DNS provider, resolvers that
             // answered the bootstrap check first. Node layers only try two, so a bad node is dropped quickly.

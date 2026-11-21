@@ -1,6 +1,5 @@
 package com.silentgatevpn.app.vpn
 
-import android.os.Build
 import com.silentgatevpn.app.SilentGateApp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -12,6 +11,7 @@ import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
 import java.net.Socket
 import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -38,7 +38,7 @@ object Prober {
     // not mark a reachable node as THROTTLED.
     private const val LOW_BURST_EXTRA = 2
     private const val LOW_BURST_MIN_OK = 2
-    private const val LOW_TIMEOUT_MS = 3_200
+    private const val LOW_TIMEOUT_MS = 3_000
 
     /**
      * Returns latency in ms of the first handshake, [UNTESTED] for UDP based nodes (cannot be tested without the
@@ -71,16 +71,16 @@ object Prober {
     /** One connection: TCP connect (+ TLS handshake for plain TLS nodes). Returns elapsed ms, or -1 on failure. */
     private fun handshake(n: Node, ip: String, timeoutMs: Int): Long {
         val t0 = System.currentTimeMillis()
-        // Android 7.0 to 9 (API 24-28) ship an old CA store and TLS stack that reject many modern certificates.
-        // Pre-flight is only a reachability test, so below Android 10 it stops at the TCP connect; sing-box (libbox)
-        // still verifies the certificate itself when the tunnel really connects.
-        val plainTls = n.security == "tls" && n.transport != "udp" && Build.VERSION.SDK_INT >= 29
+        // TLS is verified on every Android version (API 24+). SilentGateApp.installModernTls() installs Conscrypt and a
+        // composite trust store through SSLContext.setDefault(), so we take the factory from SSLContext.getDefault()
+        // (SSLSocketFactory.getDefault() can return the stale platform factory on Android 7.0 to 8.1).
+        val plainTls = n.security == "tls" && n.transport != "udp"
         return runCatching {
             Socket().use { s ->
                 s.connect(InetSocketAddress(ip, n.port), timeoutMs)
                 if (plainTls) {
                     val sni = sniOf(n)
-                    val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(s, sni, n.port, false) as SSLSocket
+                    val ssl = socketFactory().createSocket(s, sni, n.port, false) as SSLSocket
                     ssl.soTimeout = timeoutMs
                     val params = ssl.sslParameters
                     params.serverNames = listOf(SNIHostName(sni))
@@ -93,11 +93,20 @@ object Prober {
         }.getOrDefault(-1L)
     }
 
+    private fun socketFactory(): SSLSocketFactory =
+        runCatching { SSLContext.getDefault().socketFactory }.getOrNull()
+            ?: (SSLSocketFactory.getDefault() as SSLSocketFactory)
+
     private fun sniOf(n: Node): String {
         val j = runCatching { org.json.JSONObject(n.raw) }.getOrNull()
         val fromJson = j?.optJSONObject("tls")?.optString("server_name").orEmpty()
         if (fromJson.isNotEmpty()) return fromJson
-        val m = Regex("[?&](?:sni|peer)=([^&#]+)").find(n.raw)
-        return m?.groupValues?.get(1)?.takeIf { it.isNotEmpty() } ?: n.server
+        // Same order as ProxyParser.applyTls(): sni -> peer -> host -> server.
+        for (key in listOf("sni", "peer", "host")) {
+            val v = Regex("[?&]$key=([^&#]*)").find(n.raw)?.groupValues?.get(1).orEmpty()
+            val d = runCatching { java.net.URLDecoder.decode(v, "UTF-8") }.getOrDefault(v).trim()
+            if (d.isNotEmpty()) return d
+        }
+        return n.server
     }
 }
